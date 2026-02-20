@@ -1,0 +1,31 @@
+{
+  "title": "Environmental Quality",
+  "description": "Temperature, humidity and CO₂ daily trends by apartment",
+  "data_source": "data/gold/gold.db",
+  "panels": [
+    {
+      "id": "temperature_apt1",
+      "title": "Apt 1 — Daily Average Temperature (°C)",
+      "type": "timeseries",
+      "query": "SELECT date, avg_temperature FROM fact_environment_daily WHERE apt_id = 'apt1' ORDER BY date"
+    },
+    {
+      "id": "temperature_apt2",
+      "title": "Apt 2 — Daily Average Temperature (°C)",
+      "type": "timeseries",
+      "query": "SELECT date, avg_temperature FROM fact_environment_daily WHERE apt_id = 'apt2' ORDER BY date"
+    },
+    {
+      "id": "humidity",
+      "title": "Daily Average Humidity (%)",
+      "type": "timeseries",
+      "query": "SELECT date, apt_id, avg_humidity FROM fact_environment_daily ORDER BY date"
+    },
+    {
+      "id": "co2",
+      "title": "Daily Average CO₂ (ppm)",
+      "type": "timeseries",
+      "query": "SELECT date, apt_id, avg_co2_ppm FROM fact_environment_daily ORDER BY date"
+    }
+  ]
+}

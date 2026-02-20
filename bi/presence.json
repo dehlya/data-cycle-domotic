@@ -1,0 +1,25 @@
+{
+  "title": "Room Presence",
+  "description": "Occupancy patterns by apartment and day",
+  "data_source": "data/gold/gold.db",
+  "panels": [
+    {
+      "id": "presence_apt1",
+      "title": "Apt 1 — Daily Presence Ratio",
+      "type": "timeseries",
+      "query": "SELECT date, presence_ratio FROM fact_presence_daily WHERE apt_id = 'apt1' ORDER BY date"
+    },
+    {
+      "id": "presence_apt2",
+      "title": "Apt 2 — Daily Presence Ratio",
+      "type": "timeseries",
+      "query": "SELECT date, presence_ratio FROM fact_presence_daily WHERE apt_id = 'apt2' ORDER BY date"
+    },
+    {
+      "id": "presence_comparison",
+      "title": "Presence Ratio Comparison",
+      "type": "bar",
+      "query": "SELECT date, apt_id, presence_ratio FROM fact_presence_daily ORDER BY date"
+    }
+  ]
+}

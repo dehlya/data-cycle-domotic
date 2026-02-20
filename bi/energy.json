@@ -1,0 +1,25 @@
+{
+  "title": "Energy Consumption",
+  "description": "Hourly and daily energy KPIs by apartment",
+  "data_source": "data/gold/gold.db",
+  "panels": [
+    {
+      "id": "energy_hourly_apt1",
+      "title": "Apt 1 — Hourly Energy (kWh)",
+      "type": "timeseries",
+      "query": "SELECT hour, total_kwh FROM fact_energy_hourly WHERE apt_id = 'apt1' ORDER BY hour"
+    },
+    {
+      "id": "energy_hourly_apt2",
+      "title": "Apt 2 — Hourly Energy (kWh)",
+      "type": "timeseries",
+      "query": "SELECT hour, total_kwh FROM fact_energy_hourly WHERE apt_id = 'apt2' ORDER BY hour"
+    },
+    {
+      "id": "energy_daily_comparison",
+      "title": "Daily Energy Comparison (both apartments)",
+      "type": "bar",
+      "query": "SELECT strftime('%Y-%m-%d', hour) AS date, apt_id, SUM(total_kwh) AS daily_kwh FROM fact_energy_hourly GROUP BY date, apt_id ORDER BY date"
+    }
+  ]
+}

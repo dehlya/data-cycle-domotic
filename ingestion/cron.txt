@@ -1,0 +1,3 @@
+# cron job for sensor acquisition
+# Run recup.py every minute (cron controls the interval; recup.py runs a single poll each time)
+* * * * * cd /opt/data-cycle && python ingestion/recup.py >> /var/log/recup.log 2>&1
