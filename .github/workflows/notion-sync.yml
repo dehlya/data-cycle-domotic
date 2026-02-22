@@ -1,0 +1,35 @@
+name: Sync GitHub → Notion
+
+on:
+  # auto-trigger on any issue event
+  issues:
+    types: [opened, edited, closed, reopened, assigned, unassigned, labeled, unlabeled, milestoned, demilestoned]
+  # auto-trigger on any milestone event
+  milestone:
+    types: [created, edited, closed, deleted]
+  # manual trigger (the "button" from Notion or GitHub UI)
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run sync
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_BACKLOG_DB_ID: ${{ secrets.NOTION_BACKLOG_DB_ID }}
+          NOTION_SPRINTS_DB_ID: ${{ secrets.NOTION_SPRINTS_DB_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python sync.py
