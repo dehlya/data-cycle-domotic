@@ -1,0 +1,29 @@
+# env
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Data — never commit raw data
+/storage/
+
+# Logs
+*.log
+logs/
+
+# Airflow
+airflow.db
+airflow.cfg
+airflow-webserver.pid
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
