@@ -147,7 +147,7 @@ def build_issue_props(issue, sprint_url_map, schema):
         acceptance  = parts[1].strip() if len(parts) > 1 else ""
 
     props = {
-        "Name":       {"title": [{"text": {"content": issue["title"]}}]},
+        "Title":      {"title": [{"text": {"content": issue["title"]}}]},
         "Github URL": {"url": issue["html_url"]},
     }
 
@@ -180,7 +180,7 @@ def build_issue_props(issue, sprint_url_map, schema):
 
 def build_milestone_props(milestone, schema):
     props = {
-        "Name":       {"title": [{"text": {"content": milestone["title"]}}]},
+        "Sprint Name": {"title": [{"text": {"content": milestone["title"]}}]},
         "Github URL": {"url": milestone["html_url"]},
     }
 
