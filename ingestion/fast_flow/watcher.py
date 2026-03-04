@@ -1,9 +1,11 @@
 """
 watcher.py -- Pipeline loop: SMB -> Bronze -> Silver
 ===================================================
-Runs bulk_to_bronze + flatten_sensors on a fixed interval.
-Skips pipeline if newest SMB file already exists in Bronze.
-Both scripts are idempotent -- safe to run repeatedly.
+Predicts the next expected filenames based on the last known file.
+Checks with a single .exists() call -- milliseconds, no scanning.
+
+Nightly safety net: one full os.scandir at midnight to catch
+any files that prediction might have missed.
 
 Usage: python ingestion/fast_flow/watcher.py
 
@@ -14,6 +16,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -25,6 +28,7 @@ load_dotenv()
 SMB_PATH      = Path(os.getenv("SMB_PATH", r"Z:\\"))
 BRONZE_ROOT   = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
 INTERVAL_SECS = 60
+NIGHTLY_HOUR  = 0  # midnight
 
 # -- ANSI COLORS ---------------------------------------------------------------
 
@@ -40,35 +44,79 @@ CY = "\033[36m"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-APARTMENT_MAP = {"jimmyloup": "jimmy", "jeremievianin": "jeremie"}
+APARTMENTS_SMB = ["JimmyLoup", "JeremieVianin"]
 
 
-def get_newest_smb_file():
-    """Get the newest JSON filename on the SMB share (by name, not stat)."""
+def parse_filename_to_dt(filename):
+    """Parse '31.08.2023 2144_JimmyLoup_received.json' -> datetime."""
     try:
-        files = sorted(SMB_PATH.glob("*.json"))
-        return files[-1].name if files else None
+        date_part = filename.split("_")[0].strip()
+        return datetime.strptime(date_part, "%d.%m.%Y %H%M").replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
 
-def file_exists_in_bronze(filename):
-    """Check if a filename exists anywhere in the Bronze folder tree."""
+def dt_to_filename(dt, apartment):
+    """datetime -> '31.08.2023 2145_JimmyLoup_received.json'"""
+    return f"{dt.strftime('%d.%m.%Y %H%M')}_{apartment}_received.json"
+
+
+def predict_next_files(last_filename):
+    """
+    Given the last known filename, predict the next expected files.
+    Files come every minute, two apartments. Returns list of predicted names.
+    """
+    dt = parse_filename_to_dt(last_filename)
+    if dt is None:
+        return []
+
+    next_dt = dt + timedelta(minutes=1)
+    return [dt_to_filename(next_dt, apt) for apt in APARTMENTS_SMB]
+
+
+def check_predicted(predicted_files):
+    """Check if any predicted files exist on SMB. Returns list of found files."""
+    found = []
+    for name in predicted_files:
+        if (SMB_PATH / name).exists():
+            found.append(name)
+    return found
+
+
+def get_newest_bronze_filename():
+    """Find the newest filename in Bronze by checking newest folders."""
     bronze = PROJECT_ROOT / BRONZE_ROOT
     if not bronze.exists():
-        return False
-    matches = list(bronze.rglob(filename))
-    return len(matches) > 0
+        return None
+    newest = None
+    for apt in ["jimmy", "jeremie"]:
+        apt_path = bronze / apt
+        if not apt_path.exists():
+            continue
+        hour_folders = sorted(apt_path.glob("*/*/*/*"), reverse=True)
+        for folder in hour_folders:
+            if not folder.is_dir():
+                continue
+            files = sorted(folder.glob("*.json"), reverse=True)
+            if files:
+                name = files[0].name
+                if newest is None or name > newest:
+                    newest = name
+                break
+    return newest
 
 
-def check_new_data():
-    """Compare newest SMB file vs Bronze. Returns (has_new, newest_filename)."""
-    newest = get_newest_smb_file()
-    if newest is None:
-        return False, None
-    
-    already_in_bronze = file_exists_in_bronze(newest)
-    return not already_in_bronze, newest
+def get_newest_smb_filename():
+    """Full os.scandir pass -- used only for nightly safety check."""
+    newest = None
+    try:
+        for entry in os.scandir(SMB_PATH):
+            if entry.is_file(follow_symlinks=False) and entry.name.endswith(".json"):
+                if newest is None or entry.name > newest:
+                    newest = entry.name
+    except Exception as e:
+        print(f"  {RE}SMB scan error: {e}{R}")
+    return newest
 
 
 def run_pipeline():
@@ -119,38 +167,69 @@ def run():
     print(f"{D}Bronze   : {(PROJECT_ROOT / BRONZE_ROOT).resolve()}{R}")
     print(f"{D}Interval : {INTERVAL_SECS}s{R}")
     print(f"{D}Pipeline : bulk_to_bronze -> flatten_sensors{R}")
+    print(f"{D}Check    : prediction (nightly full scan at {NIGHTLY_HOUR:02d}:00){R}")
     print(f"{D}Ctrl+C to stop{R}\n")
+
+    # Find starting point
+    print(f"  {D}Finding newest Bronze file...{R}", end=" ")
+    last_known = get_newest_bronze_filename()
+    if last_known:
+        print(f"{GR}{last_known}{R}")
+    else:
+        print(f"{YE}none -- first run will do full scan{R}")
 
     run_count = 0
     skip_count = 0
     pipeline_count = 0
     total_time = 0
     last_run_str = "never"
+    nightly_done_today = False
 
     try:
         while True:
             run_count += 1
             now = time.strftime("%H:%M:%S")
+            current_hour = int(time.strftime("%H"))
 
-            # Quick check: is there new data?
-            print(f"\n  {D}[{now}] Checking for new files...{R}", end=" ")
-            t_check = time.monotonic()
-            has_new, newest = check_new_data()
-            check_time = time.monotonic() - t_check
+            # Reset nightly flag at 1am
+            if current_hour == NIGHTLY_HOUR + 1:
+                nightly_done_today = False
 
-            if not has_new:
-                skip_count += 1
-                if newest:
-                    print(f"{D}latest: {newest} (already in Bronze) -- {check_time:.1f}s{R}")
+            # Nightly safety scan
+            if current_hour == NIGHTLY_HOUR and not nightly_done_today:
+                nightly_done_today = True
+                print(f"\n  {YE}[{now}] NIGHTLY SCAN -- full os.scandir check{R}", end=" ", flush=True)
+                t_check = time.monotonic()
+                newest_smb = get_newest_smb_filename()
+                check_time = time.monotonic() - t_check
+
+                if newest_smb and (last_known is None or newest_smb > last_known):
+                    print(f"{GR}found newer: {newest_smb} ({check_time:.0f}s) -- running pipeline{R}")
+                    # Run pipeline
+                    pipeline_count += 1
+                    print(f"\n{CY}{B}{'=' * 56}{R}")
+                    print(f"{CY}{B}  PIPELINE #{pipeline_count} (nightly) -- {now}{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}\n")
+
+                    elapsed = run_pipeline()
+                    total_time += elapsed
+                    last_known = get_newest_bronze_filename()
+                    last_run_str = f"{time.strftime('%H:%M:%S')} ({elapsed:.0f}s, nightly)"
+
+                    print(f"{CY}{B}{'=' * 56}{R}")
+                    print(f"{GR}{B}  PIPELINE #{pipeline_count} COMPLETE -- {elapsed:.0f}s{R}")
+                    if last_known:
+                        print(f"{D}  newest: {last_known}{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}")
                 else:
-                    print(f"{D}no files on SMB{R}")
+                    print(f"{D}all caught up ({check_time:.0f}s){R}")
 
-                # Countdown to next check
+                # Continue to normal countdown
                 for remaining in range(INTERVAL_SECS, 0, -1):
                     mins, secs = divmod(remaining, 60)
                     print(
-                        f"\r  {D}[{time.strftime('%H:%M:%S')}] idle -- next check in {mins:02d}:{secs:02d}"
-                        f"  |  runs: {pipeline_count}  skipped: {skip_count}"
+                        f"\r  {D}[{time.strftime('%H:%M:%S')}] idle -- next in {mins:02d}:{secs:02d}"
+                        f"  |  pipelines: {pipeline_count}  skipped: {skip_count}"
                         f"  |  last: {last_run_str}{R}   ",
                         end="", flush=True,
                     )
@@ -158,29 +237,68 @@ def run():
                 print()
                 continue
 
-            # New data found -- run pipeline
-            print(f"{GR}NEW: {newest} -- running pipeline{R}")
-            pipeline_count += 1
+            # Normal cycle: predict next files
+            if last_known is None:
+                # No baseline -- need full scan first time
+                print(f"\n  {YE}[{now}] No baseline -- full scan{R}", end=" ", flush=True)
+                t_check = time.monotonic()
+                newest_smb = get_newest_smb_filename()
+                check_time = time.monotonic() - t_check
 
-            print(f"\n{CY}{B}{'=' * 56}{R}")
-            print(f"{CY}{B}  PIPELINE #{pipeline_count} -- {now}{R}")
-            print(f"{CY}{B}{'=' * 56}{R}\n")
+                if newest_smb:
+                    print(f"{GR}{newest_smb} ({check_time:.0f}s){R}")
+                    pipeline_count += 1
+                    print(f"\n{CY}{B}{'=' * 56}{R}")
+                    print(f"{CY}{B}  PIPELINE #{pipeline_count} -- {now}{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}\n")
 
-            elapsed = run_pipeline()
-            total_time += elapsed
-            last_run_str = f"{time.strftime('%H:%M:%S')} ({elapsed:.0f}s)"
+                    elapsed = run_pipeline()
+                    total_time += elapsed
+                    last_known = get_newest_bronze_filename()
+                    last_run_str = f"{time.strftime('%H:%M:%S')} ({elapsed:.0f}s)"
 
-            print(f"{CY}{B}{'=' * 56}{R}")
-            print(f"{GR}{B}  PIPELINE #{pipeline_count} COMPLETE -- {elapsed:.0f}s{R}")
-            print(f"{D}  checks: {run_count}  |  pipelines: {pipeline_count}  |  skipped: {skip_count}  |  {total_time / 60:.1f}min{R}")
-            print(f"{CY}{B}{'=' * 56}{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}")
+                    print(f"{GR}{B}  PIPELINE #{pipeline_count} COMPLETE -- {elapsed:.0f}s{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}")
+                else:
+                    print(f"{D}no files on SMB{R}")
+            else:
+                # Predict and check
+                predicted = predict_next_files(last_known)
+                print(f"\n  {D}[{now}] Checking {predicted[0][:20]}...{R}", end=" ", flush=True)
+                t_check = time.monotonic()
+                found = check_predicted(predicted)
+                check_time = time.monotonic() - t_check
 
-            # Countdown to next check
+                if found:
+                    print(f"{GR}+{len(found)} new ({check_time:.2f}s){R}")
+
+                    pipeline_count += 1
+                    print(f"\n{CY}{B}{'=' * 56}{R}")
+                    print(f"{CY}{B}  PIPELINE #{pipeline_count} -- {now}{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}\n")
+
+                    elapsed = run_pipeline()
+                    total_time += elapsed
+                    last_known = get_newest_bronze_filename()
+                    last_run_str = f"{time.strftime('%H:%M:%S')} ({elapsed:.0f}s)"
+
+                    print(f"{CY}{B}{'=' * 56}{R}")
+                    print(f"{GR}{B}  PIPELINE #{pipeline_count} COMPLETE -- {elapsed:.0f}s{R}")
+                    print(f"{D}  checks: {run_count}  |  pipelines: {pipeline_count}  |  skipped: {skip_count}{R}")
+                    if last_known:
+                        print(f"{D}  newest: {last_known}{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}")
+                else:
+                    skip_count += 1
+                    print(f"{D}not yet ({check_time:.2f}s){R}")
+
+            # Countdown
             for remaining in range(INTERVAL_SECS, 0, -1):
                 mins, secs = divmod(remaining, 60)
                 print(
-                    f"\r  {D}[{time.strftime('%H:%M:%S')}] idle -- next check in {mins:02d}:{secs:02d}"
-                    f"  |  runs: {pipeline_count}  skipped: {skip_count}"
+                    f"\r  {D}[{time.strftime('%H:%M:%S')}] idle -- next in {mins:02d}:{secs:02d}"
+                    f"  |  pipelines: {pipeline_count}  skipped: {skip_count}"
                     f"  |  last: {last_run_str}{R}   ",
                     end="", flush=True,
                 )
