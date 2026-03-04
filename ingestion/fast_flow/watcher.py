@@ -1,48 +1,32 @@
 """
-watcher.py — Watch SMB share, trigger pipeline on new files
-============================================================
-Watches Z:\\ for new JSON files. When a batch arrives:
-  1. Waits for the batch to finish (debounce 60s)
-  2. Runs bulk_to_bronze.py (copies new files to Bronze)
-  3. Runs flatten_sensors.py (flattens new files to Silver)
-
-No duplicate work — both scripts are resume-capable.
+watcher.py -- Pipeline loop: SMB -> Bronze -> Silver
+===================================================
+Runs bulk_to_bronze + flatten_sensors on a fixed interval.
+Skips pipeline if newest SMB file already exists in Bronze.
+Both scripts are idempotent -- safe to run repeatedly.
 
 Usage: python ingestion/fast_flow/watcher.py
 
-Author: Group 14 · Data Cycle Project · HES-SO Valais 2026
+Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
 
-import logging
 import os
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers.polling import PollingObserver
 
 load_dotenv()
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+# -- CONFIG --------------------------------------------------------------------
 
-SMB_PATH       = Path(os.getenv("SMB_PATH", r"Z:\\"))
-DEBOUNCE_SECS  = 60   # wait this long after last file before triggering pipeline
-POLL_INTERVAL  = 10   # how often to check SMB for changes (seconds)
+SMB_PATH      = Path(os.getenv("SMB_PATH", r"Z:\\"))
+BRONZE_ROOT   = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
+INTERVAL_SECS = 60
 
-# ── LOGGING ───────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("watcher")
-
-# ── ANSI COLORS ───────────────────────────────────────────────────────────────
+# -- ANSI COLORS ---------------------------------------------------------------
 
 R  = "\033[0m"
 B  = "\033[1m"
@@ -52,122 +36,76 @@ RE = "\033[31m"
 YE = "\033[33m"
 CY = "\033[36m"
 
-# ── PIPELINE ──────────────────────────────────────────────────────────────────
+# -- PIPELINE ------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-PIPELINE_STEPS = [
-    {
-        "name": "bulk_to_bronze",
-        "script": PROJECT_ROOT / "ingestion" / "fast_flow" / "bulk_to_bronze.py",
-        "desc": "SMB → Bronze",
-    },
-    {
-        "name": "flatten_sensors",
-        "script": PROJECT_ROOT / "etl" / "bronze_to_silver" / "flatten_sensors.py",
-        "desc": "Bronze → Silver",
-    },
-]
+APARTMENT_MAP = {"jimmyloup": "jimmy", "jeremievianin": "jeremie"}
+
+
+def get_newest_smb_file():
+    """Get the newest JSON filename on the SMB share (by name, not stat)."""
+    try:
+        files = sorted(SMB_PATH.glob("*.json"))
+        return files[-1].name if files else None
+    except Exception:
+        return None
+
+
+def file_exists_in_bronze(filename):
+    """Check if a filename exists anywhere in the Bronze folder tree."""
+    bronze = PROJECT_ROOT / BRONZE_ROOT
+    if not bronze.exists():
+        return False
+    matches = list(bronze.rglob(filename))
+    return len(matches) > 0
+
+
+def check_new_data():
+    """Compare newest SMB file vs Bronze. Returns (has_new, newest_filename)."""
+    newest = get_newest_smb_file()
+    if newest is None:
+        return False, None
+    
+    already_in_bronze = file_exists_in_bronze(newest)
+    return not already_in_bronze, newest
 
 
 def run_pipeline():
-    """Run all pipeline steps in sequence."""
-    print(f"\n{CY}{B}{'═' * 56}{R}")
-    print(f"{CY}{B}  PIPELINE TRIGGERED{R}")
-    print(f"{CY}{B}{'═' * 56}{R}\n")
-
+    """Run all pipeline steps in sequence. Returns elapsed seconds."""
     t_start = time.monotonic()
 
-    for step in PIPELINE_STEPS:
-        script = step["script"]
+    steps = [
+        ("bulk_to_bronze",  PROJECT_ROOT / "ingestion" / "fast_flow" / "bulk_to_bronze.py",  "SMB -> Bronze"),
+        ("flatten_sensors", PROJECT_ROOT / "etl" / "bronze_to_silver" / "flatten_sensors.py", "Bronze -> Silver"),
+    ]
+
+    for name, script, desc in steps:
         if not script.exists():
-            print(f"  {RE}✗ {step['name']} — script not found: {script}{R}")
+            print(f"  {RE}x {name} -- script not found: {script}{R}")
             continue
 
-        print(f"  {YE}▶{R} {step['name']} — {step['desc']}")
+        print(f"  {YE}>{R} {name} -- {desc}")
         try:
             result = subprocess.run(
-                [sys.executable, str(script)],
+                [sys.executable, "-u", str(script)],
                 cwd=str(PROJECT_ROOT),
-                timeout=7200,  # 2h max per step
+                timeout=7200,
             )
             if result.returncode == 0:
-                print(f"  {GR}✓{R} {step['name']} done\n")
+                print(f"  {GR}v{R} {name} done\n")
             else:
-                print(f"  {RE}✗ {step['name']} exited with code {result.returncode}{R}\n")
+                print(f"  {RE}x {name} exited with code {result.returncode}{R}\n")
         except subprocess.TimeoutExpired:
-            print(f"  {RE}✗ {step['name']} timed out (2h){R}\n")
+            print(f"  {RE}x {name} timed out (2h){R}\n")
         except Exception as e:
-            print(f"  {RE}✗ {step['name']} error: {e}{R}\n")
+            print(f"  {RE}x {name} error: {e}{R}\n")
 
     elapsed = time.monotonic() - t_start
-    print(f"{CY}{B}{'═' * 56}{R}")
-    print(f"{GR}{B}  PIPELINE COMPLETE — {elapsed / 60:.1f}min{R}")
-    print(f"{CY}{B}{'═' * 56}{R}\n")
+    return elapsed
 
 
-# ── DEBOUNCED HANDLER ─────────────────────────────────────────────────────────
-
-class DebouncedHandler(FileSystemEventHandler):
-    """
-    Collects new file events and triggers the pipeline once
-    no new files have arrived for DEBOUNCE_SECS seconds.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self._timer = None
-        self._lock = threading.Lock()
-        self._new_files = 0
-        self._pipeline_running = False
-
-    def on_created(self, event):
-        if event.is_directory:
-            return
-
-        path = Path(event.src_path)
-        if path.suffix.lower() != ".json":
-            return
-
-        with self._lock:
-            self._new_files += 1
-            count = self._new_files
-
-            if self._pipeline_running:
-                log.info(f"Pipeline running — queuing {path.name}")
-                return
-
-            # Cancel previous timer and start a new one
-            if self._timer is not None:
-                self._timer.cancel()
-
-            self._timer = threading.Timer(DEBOUNCE_SECS, self._trigger)
-            self._timer.start()
-
-        log.info(f"New file: {path.name}  ({count} in batch, waiting {DEBOUNCE_SECS}s...)")
-
-    def _trigger(self):
-        with self._lock:
-            count = self._new_files
-            self._new_files = 0
-            self._pipeline_running = True
-
-        print(f"\n  {GR}Batch complete — {count} new file(s) detected{R}")
-
-        try:
-            run_pipeline()
-        finally:
-            with self._lock:
-                self._pipeline_running = False
-
-                # If new files arrived while pipeline was running, trigger again
-                if self._new_files > 0:
-                    log.info(f"{self._new_files} files arrived during pipeline — retriggering...")
-                    self._timer = threading.Timer(DEBOUNCE_SECS, self._trigger)
-                    self._timer.start()
-
-
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+# -- MAIN ----------------------------------------------------------------------
 
 def run():
     if not SMB_PATH.exists():
@@ -176,27 +114,84 @@ def run():
             "Is Z: mounted? Check File Explorer."
         )
 
-    print(f"\n{B}watcher — SMB → Pipeline{R}")
-    print(f"{D}Watching : {SMB_PATH}{R}")
-    print(f"{D}Debounce : {DEBOUNCE_SECS}s after last file{R}")
-    print(f"{D}Polling  : every {POLL_INTERVAL}s{R}")
-    print(f"{D}Pipeline : bulk_to_bronze → flatten_sensors{R}")
+    print(f"\n{B}watcher -- Pipeline Loop{R}")
+    print(f"{D}SMB      : {SMB_PATH}{R}")
+    print(f"{D}Bronze   : {(PROJECT_ROOT / BRONZE_ROOT).resolve()}{R}")
+    print(f"{D}Interval : {INTERVAL_SECS}s{R}")
+    print(f"{D}Pipeline : bulk_to_bronze -> flatten_sensors{R}")
     print(f"{D}Ctrl+C to stop{R}\n")
 
-    handler  = DebouncedHandler()
-    observer = PollingObserver(timeout=POLL_INTERVAL)
-    observer.schedule(handler, path=str(SMB_PATH), recursive=False)
-    observer.start()
+    run_count = 0
+    skip_count = 0
+    pipeline_count = 0
+    total_time = 0
+    last_run_str = "never"
 
     try:
         while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print(f"\n{D}Stopping watcher...{R}")
-        observer.stop()
+            run_count += 1
+            now = time.strftime("%H:%M:%S")
 
-    observer.join()
-    print(f"{D}Done.{R}\n")
+            # Quick check: is there new data?
+            print(f"\n  {D}[{now}] Checking for new files...{R}", end=" ")
+            t_check = time.monotonic()
+            has_new, newest = check_new_data()
+            check_time = time.monotonic() - t_check
+
+            if not has_new:
+                skip_count += 1
+                if newest:
+                    print(f"{D}latest: {newest} (already in Bronze) -- {check_time:.1f}s{R}")
+                else:
+                    print(f"{D}no files on SMB{R}")
+
+                # Countdown to next check
+                for remaining in range(INTERVAL_SECS, 0, -1):
+                    mins, secs = divmod(remaining, 60)
+                    print(
+                        f"\r  {D}[{time.strftime('%H:%M:%S')}] idle -- next check in {mins:02d}:{secs:02d}"
+                        f"  |  runs: {pipeline_count}  skipped: {skip_count}"
+                        f"  |  last: {last_run_str}{R}   ",
+                        end="", flush=True,
+                    )
+                    time.sleep(1)
+                print()
+                continue
+
+            # New data found -- run pipeline
+            print(f"{GR}NEW: {newest} -- running pipeline{R}")
+            pipeline_count += 1
+
+            print(f"\n{CY}{B}{'=' * 56}{R}")
+            print(f"{CY}{B}  PIPELINE #{pipeline_count} -- {now}{R}")
+            print(f"{CY}{B}{'=' * 56}{R}\n")
+
+            elapsed = run_pipeline()
+            total_time += elapsed
+            last_run_str = f"{time.strftime('%H:%M:%S')} ({elapsed:.0f}s)"
+
+            print(f"{CY}{B}{'=' * 56}{R}")
+            print(f"{GR}{B}  PIPELINE #{pipeline_count} COMPLETE -- {elapsed:.0f}s{R}")
+            print(f"{D}  checks: {run_count}  |  pipelines: {pipeline_count}  |  skipped: {skip_count}  |  {total_time / 60:.1f}min{R}")
+            print(f"{CY}{B}{'=' * 56}{R}")
+
+            # Countdown to next check
+            for remaining in range(INTERVAL_SECS, 0, -1):
+                mins, secs = divmod(remaining, 60)
+                print(
+                    f"\r  {D}[{time.strftime('%H:%M:%S')}] idle -- next check in {mins:02d}:{secs:02d}"
+                    f"  |  runs: {pipeline_count}  skipped: {skip_count}"
+                    f"  |  last: {last_run_str}{R}   ",
+                    end="", flush=True,
+                )
+                time.sleep(1)
+            print()
+
+    except KeyboardInterrupt:
+        print(f"\n\n{B}{'-' * 56}{R}")
+        print(f"{D}Stopped after {run_count} checks ({pipeline_count} pipelines, {skip_count} skipped){R}")
+        print(f"{D}Total pipeline time: {total_time / 60:.1f}min{R}")
+        print(f"{B}{'-' * 56}{R}\n")
 
 
 if __name__ == "__main__":
