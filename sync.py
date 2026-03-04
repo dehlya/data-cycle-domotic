@@ -272,7 +272,7 @@ def write_summary(skipped_milestones, skipped_issues):
 # ── SYNC ─────────────────────────────────────────────────────────────────────
 
 def sync_milestones():
-    print("── Syncing milestones → Sprints DB ──")
+    print("── Syncing milestones -> Sprints DB ──")
     schema = get_db_schema(NOTION_SPRINTS_DB)
     print(f"  Schema: { {k: v['type'] for k, v in schema.items()} }")
 
@@ -302,7 +302,7 @@ def sync_milestones():
 
 
 def sync_issues(sprint_map):
-    print("── Syncing issues → Backlog DB ──")
+    print("── Syncing issues -> Backlog DB ──")
     schema   = get_db_schema(NOTION_BACKLOG_DB)
     print(f"  Schema: { {k: v['type'] for k, v in schema.items()} }")
 

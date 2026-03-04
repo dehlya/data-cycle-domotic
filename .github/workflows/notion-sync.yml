@@ -1,4 +1,4 @@
-name: Sync GitHub → Notion
+name: Sync GitHub -> Notion
 
 on:
   # auto-trigger on any issue event

@@ -41,7 +41,7 @@ Technical overview of the UC2 Apartments Domotic data pipeline.
 │                              log_sensor_errors                  │
 └─────────────────────────────┬───────────────────────────────────┘
                               │
-                              │  Silver → Gold ETL (Sprint 3)
+                              │  Silver -> Gold ETL (Sprint 3)
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  GOLD — PostgreSQL                                              │
@@ -67,7 +67,7 @@ Technical overview of the UC2 Apartments Domotic data pipeline.
 │         KNIME      │      │                        │
 └─────────┬──────────┘      └────────────────────────┘
           │
-          │ predictions → gold.fact_ml_predictions
+          │ predictions -> gold.fact_ml_predictions
           ▼
        BI reads enriched Gold
 ```
@@ -116,8 +116,8 @@ Storage: PostgreSQL `gold` schema
 
 ML models read from **Silver** (not Gold) because Silver has full-resolution data that Gold aggregates away:
 
-- Silver `sensor_events` has minute-by-minute readings → ML can detect patterns, spikes, cycles
-- Gold `fact_energy` has hourly kWh → too coarse for a forecasting model
+- Silver `sensor_events` has minute-by-minute readings -> ML can detect patterns, spikes, cycles
+- Gold `fact_energy` has hourly kWh -> too coarse for a forecasting model
 
 The flow:
 1. ML reads Silver for training data

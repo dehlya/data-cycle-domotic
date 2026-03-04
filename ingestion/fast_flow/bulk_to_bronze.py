@@ -1,5 +1,5 @@
 """
-bulk_to_bronze.py — Historical bulk load: SMB → Bronze
+bulk_to_bronze.py — Historical bulk load: SMB -> Bronze
 =======================================================
 Parallel copy — 16 threads to saturate SMB bandwidth.
 Resume-capable — skips files already in Bronze.
@@ -68,7 +68,7 @@ def run():
 
     BRONZE_ROOT.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n{B}bulk_to_bronze — SMB → Bronze{R}")
+    print(f"\n{B}bulk_to_bronze — SMB -> Bronze{R}")
     print(f"{D}Source  : {SMB_PATH}{R}")
     print(f"{D}Bronze  : {BRONZE_ROOT.resolve()}{R}")
     print(f"{D}Workers : {WORKERS} parallel threads{R}\n")

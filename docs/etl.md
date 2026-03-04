@@ -9,9 +9,9 @@ Technical documentation for all ETL scripts in the project.
 ```
 Sources                          Silver                          Gold
 ───────                          ──────                          ────
-JSON sensors (Bronze)  ──→  sensor_events (15M rows)  ──→  fact_energy
-MySQL DB (pidb)        ──→  dim_buildings, dim_rooms…  ──→  fact_occupation
-Weather CSV (Bronze)   ──→  (Sacha — TBD)              ──→  fact_environment
+JSON sensors (Bronze)  ──->  sensor_events (15M rows)  ──->  fact_energy
+MySQL DB (pidb)        ──->  dim_buildings, dim_rooms…  ──->  fact_occupation
+Weather CSV (Bronze)   ──->  (Sacha — TBD)              ──->  fact_environment
 ```
 
 All ETL scripts live in `etl/` and use SQLAlchemy + the `DB_URL` from `.env`.
@@ -168,7 +168,7 @@ The watermark system (`silver.etl_watermark`) tracks processed filenames. If the
 
 > **Status:** Not yet implemented. Assigned to Sacha.
 >
-> Will handle: Weather CSV from sFTP → `silver.weather_forecasts`
+> Will handle: Weather CSV from sFTP -> `silver.weather_forecasts`
 
 ---
 

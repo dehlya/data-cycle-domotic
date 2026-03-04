@@ -47,7 +47,7 @@ BI               Power BI (energy, environment) · SAP SAC (presence)
 
 ```
 ingestion/      recup.py (async sensor polling) · weather_download.py (sFTP)
-etl/            Bronze → Silver → Gold transformation scripts
+etl/            Bronze -> Silver -> Gold transformation scripts
 ml/             models/ (Python) · knime/ (KNIME workflow exports)
 bi/             powerbi/ (.pbix files) · sac/ (SAC exports)
 storage/        local data — gitignored
