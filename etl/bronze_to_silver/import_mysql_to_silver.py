@@ -24,7 +24,7 @@ load_dotenv()
 
 # ── Config ──────────────────────────────────────────────────────────────────
 DB_URL    = os.getenv("DB_URL")  # local Postgres
-MYSQL_URL = os.getenv("MYSQL_URL", "mysql+pymysql://student:widSN3Ey35fWVOxY@10.130.25.152:3306/Appartments")
+MYSQL_URL = os.getenv("MYSQL_URL", "mysql+pymysql://student:password@10.130.25.152:3306/Appartments")
 
 # Tables to import: (mysql_table, silver_table, description)
 TABLES = [
