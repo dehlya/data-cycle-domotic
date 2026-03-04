@@ -1,274 +1,159 @@
 """
-fast_flow.py — Fast flow: SMB → Bronze
-=======================================
-Watches Z:\\ for new JSON files (one per minute per apartment).
-On each new file:
-  1. Identifies the apartment from the filename
-  2. Copies it to Bronze with YYYY/MM/DD/HH/ structure (source untouched)
-  3. Parses and flattens the JSON
-  4. Pretty-prints a summary to the terminal
+watcher.py -- Pipeline loop: SMB -> Bronze -> Silver
+===================================================
+Predicts the next expected filenames based on the last known file.
+Checks with a single .exists() call -- milliseconds, no scanning.
 
-No database required yet — Bronze only, dry run for validation.
+Nightly safety net: one full os.scandir at midnight to catch
+any files that prediction might have missed.
 
-Usage:
-  python ingestion/fast_flow.py
+Usage: python ingestion/fast_flow/watcher.py
 
-Author: Group 14 · Data Cycle Project · HES-SO Valais 2026
+Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
 
-import json
-import logging
 import os
-import shutil
+import subprocess
+import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers.polling import PollingObserver
 
 load_dotenv()
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+# -- CONFIG --------------------------------------------------------------------
 
-SMB_PATH    = Path(os.getenv("SMB_PATH",    r"Z:\\"))
-BRONZE_ROOT = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
+SMB_PATH      = Path(os.getenv("SMB_PATH", r"Z:\\"))
+BRONZE_ROOT   = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
+INTERVAL_SECS = 60
+NIGHTLY_HOUR  = 0  # midnight
 
-# ── LOGGING ───────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("fast_flow")
-
-# ── ANSI COLORS ───────────────────────────────────────────────────────────────
+# -- ANSI COLORS ---------------------------------------------------------------
 
 R  = "\033[0m"
 B  = "\033[1m"
 D  = "\033[2m"
 GR = "\033[32m"
-BL = "\033[34m"
+RE = "\033[31m"
 YE = "\033[33m"
 CY = "\033[36m"
-RE = "\033[31m"
-WH = "\033[97m"
 
-APT_COLOR    = {"jimmy": BL, "jeremie": GR}
-SENSOR_COLOR = {
-    "plug": YE, "door": CY, "window": CY,
-    "motion": WH, "meteo": GR, "humidity": BL, "consumption": RE,
-}
+# -- PIPELINE ------------------------------------------------------------------
 
-# ── APARTMENT IDENTIFICATION ──────────────────────────────────────────────────
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-APARTMENT_MAP = {
-    "jimmyloup":     "jimmy",
-    "jeremievianin": "jeremie",
-}
+APARTMENTS_SMB = ["JimmyLoup", "JeremieVianin"]
 
-def identify_apartment(filename: str) -> str | None:
-    lower = filename.lower()
-    for key, name in APARTMENT_MAP.items():
-        if key in lower:
-            return name
-    return None
 
-# ── BRONZE PATH ───────────────────────────────────────────────────────────────
-
-def bronze_path(apartment: str, ts: datetime, filename: str) -> Path:
-    """
-    bronze/<apartment>/YYYY/MM/DD/HH/<filename>
-    """
-    folder = (
-        BRONZE_ROOT
-        / apartment
-        / ts.strftime("%Y")
-        / ts.strftime("%m")
-        / ts.strftime("%d")
-        / ts.strftime("%H")
-    )
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder / filename
-
-# ── TIMESTAMP PARSING ─────────────────────────────────────────────────────────
-
-def parse_timestamp(raw: str) -> datetime:
+def parse_filename_to_dt(filename):
+    """Parse '31.08.2023 2144_JimmyLoup_received.json' -> datetime."""
     try:
-        return datetime.strptime(raw, "%d.%m.%Y %H:%M").replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        return datetime.now(tz=timezone.utc)
+        date_part = filename.split("_")[0].strip()
+        return datetime.strptime(date_part, "%d.%m.%Y %H%M").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
-# ── ROOM NORMALISATION ────────────────────────────────────────────────────────
 
-ROOM_MAP = {
-    "Bhroom": "Bathroom", "Bdroom": "Bedroom",
-    "Livingroom": "Living Room", "Office": "Office",
-    "Kitchen": "Kitchen", "Laundry": "Laundry",
-    "Outdoor": "Outdoor", "House": "House",
-}
+def dt_to_filename(dt, apartment):
+    """datetime -> '31.08.2023 2145_JimmyLoup_received.json'"""
+    return f"{dt.strftime('%d.%m.%Y %H%M')}_{apartment}_received.json"
 
-def norm_room(r: str) -> str:
-    return ROOM_MAP.get(r, r)
 
-# ── OUTLIER DETECTION ─────────────────────────────────────────────────────────
+def predict_next_files(last_filename):
+    """
+    Given the last known filename, predict the next expected files.
+    Files come every minute, two apartments. Returns list of predicted names.
+    """
+    dt = parse_filename_to_dt(last_filename)
+    if dt is None:
+        return []
 
-BOUNDS = {
-    "temperature_c": (-20, 60), "humidity_pct": (0, 100),
-    "co2_ppm": (300, 5000),     "noise_db": (0, 140),
-    "pressure_hpa": (870, 1085),"power": (0, 10000),
-    "battery": (0, 100),
-}
+    next_dt = dt + timedelta(minutes=1)
+    return [dt_to_filename(next_dt, apt) for apt in APARTMENTS_SMB]
 
-def is_outlier(field: str, value) -> bool:
-    if field not in BOUNDS or value is None:
-        return False
-    lo, hi = BOUNDS[field]
-    return not (lo <= value <= hi)
 
-# ── FLATTENERS ────────────────────────────────────────────────────────────────
+def check_predicted(predicted_files):
+    """Check if any predicted files exist on SMB. Returns list of found files."""
+    found = []
+    for name in predicted_files:
+        if (SMB_PATH / name).exists():
+            found.append(name)
+    return found
 
-def make_row(apt, room, stype, field, value, unit, ts):
-    v = float(value) if value is not None else None
-    return {
-        "apartment": apt, "room": norm_room(room),
-        "sensor_type": stype, "field": field,
-        "value": v, "unit": unit, "timestamp": ts,
-        "is_outlier": is_outlier(field, v),
-    }
 
-def flatten(apt: str, payload: dict, ts: datetime) -> list[dict]:
-    rows = []
+def get_newest_bronze_filename():
+    """Find the newest filename in Bronze by checking newest folders."""
+    bronze = PROJECT_ROOT / BRONZE_ROOT
+    if not bronze.exists():
+        return None
+    newest = None
+    for apt in ["jimmy", "jeremie"]:
+        apt_path = bronze / apt
+        if not apt_path.exists():
+            continue
+        hour_folders = sorted(apt_path.glob("*/*/*/*"), reverse=True)
+        for folder in hour_folders:
+            if not folder.is_dir():
+                continue
+            files = sorted(folder.glob("*.json"), reverse=True)
+            if files:
+                name = files[0].name
+                if newest is None or name > newest:
+                    newest = name
+                break
+    return newest
 
-    for room, d in payload.get("plugs", {}).items():
-        for f, u in [("power","W"),("total","Wh"),("temperature","°C")]:
-            if d.get(f) is not None:
-                rows.append(make_row(apt, room, "plug", f, d[f], u, ts))
 
-    for room, sensors in payload.get("doorsWindows", {}).items():
-        if not isinstance(sensors, list): sensors = [sensors]
-        for s in sensors:
-            stype = s.get("type","door").lower()
-            rows.append(make_row(apt, room, stype, "open",
-                1.0 if str(s.get("switch","off")).lower()=="on" else 0.0, "bool", ts))
-            if s.get("battery") is not None:
-                rows.append(make_row(apt, room, stype, "battery", s["battery"], "%", ts))
+def get_newest_smb_filename():
+    """Full os.scandir pass -- used only for nightly safety check."""
+    newest = None
+    try:
+        for entry in os.scandir(SMB_PATH):
+            if entry.is_file(follow_symlinks=False) and entry.name.endswith(".json"):
+                if newest is None or entry.name > newest:
+                    newest = entry.name
+    except Exception as e:
+        print(f"  {RE}SMB scan error: {e}{R}")
+    return newest
 
-    for room, d in payload.get("motions", {}).items():
-        for f, u in [("motion","bool"),("light","lux"),("temperature","°C")]:
-            if d.get(f) is not None:
-                v = 1.0 if d[f] is True else (0.0 if d[f] is False else d[f])
-                rows.append(make_row(apt, room, "motion", f, v, u, ts))
 
-    inner = payload.get("meteos", {}).get("meteo", payload.get("meteos", {}))
-    for room, d in inner.items():
-        for src, field, unit in [
-            ("Temperature","temperature_c","°C"),("CO2","co2_ppm","ppm"),
-            ("Humidity","humidity_pct","%"),("Noise","noise_db","dB"),
-            ("Pressure","pressure_hpa","hPa"),("battery_percent","battery","%"),
-        ]:
-            if d.get(src) is not None:
-                rows.append(make_row(apt, room, "meteo", field, d[src], unit, ts))
+def run_pipeline():
+    """Run all pipeline steps in sequence. Returns elapsed seconds."""
+    t_start = time.monotonic()
 
-    for room, d in payload.get("humidities", {}).items():
-        for f, u in [("temperature","°C"),("humidity","%")]:
-            if d.get(f) is not None:
-                rows.append(make_row(apt, room, "humidity", f, d[f], u, ts))
-        if d.get("devicePower") is not None:
-            rows.append(make_row(apt, room, "humidity", "battery", d["devicePower"], "%", ts))
+    steps = [
+        ("bulk_to_bronze",  PROJECT_ROOT / "ingestion" / "fast_flow" / "bulk_to_bronze.py",  "SMB -> Bronze"),
+        ("flatten_sensors", PROJECT_ROOT / "etl" / "bronze_to_silver" / "flatten_sensors.py", "Bronze -> Silver"),
+    ]
 
-    for loc, d in payload.get("consumptions", {}).items():
-        for f, u in [("total_power","W"),("power1","W"),("power2","W"),("power3","W"),
-                     ("current1","A"),("current2","A"),("current3","A"),
-                     ("voltage1","V"),("voltage2","V"),("voltage3","V")]:
-            if d.get(f) is not None:
-                rows.append(make_row(apt, loc, "consumption", f, d[f], u, ts))
+    for name, script, desc in steps:
+        if not script.exists():
+            print(f"  {RE}x {name} -- script not found: {script}{R}")
+            continue
 
-    return rows
-
-# ── PRETTY PRINT ──────────────────────────────────────────────────────────────
-
-def print_summary(apt: str, filename: str, dst: Path, ts: datetime, rows: list[dict]):
-    ac = APT_COLOR.get(apt, WH)
-    outliers = [r for r in rows if r["is_outlier"]]
-
-    print(f"\n{ac}{B}{'─'*64}{R}")
-    print(f"{ac}{B}  {apt.upper()}{R}  {D}{filename}{R}")
-    print(f"{D}  {ts.strftime('%Y-%m-%d %H:%M UTC')}  ·  {len(rows)} readings{R}")
-    print(f"{ac}{B}{'─'*64}{R}")
-
-    by_type: dict[str, list] = {}
-    for r in rows:
-        by_type.setdefault(r["sensor_type"], []).append(r)
-
-    for stype, type_rows in by_type.items():
-        sc = SENSOR_COLOR.get(stype, WH)
-        print(f"\n  {sc}{B}{stype.upper()}{R}")
-
-        by_room: dict[str, list] = {}
-        for r in type_rows:
-            by_room.setdefault(r["room"], []).append(r)
-
-        for room, rrows in by_room.items():
-            parts = []
-            for r in rrows:
-                if r["value"] is None:
-                    continue
-                flag = f"  {RE}⚠{R}" if r["is_outlier"] else ""
-                parts.append(
-                    f"{D}{r['field']}:{R} "
-                    f"{RE if r['is_outlier'] else WH}"
-                    f"{r['value']:.1f}{r['unit']}{R}{flag}"
-                )
-            if parts:
-                print(f"    {D}{room:<16}{R} {'  '.join(parts)}")
-
-    print(f"\n  {GR}✓ Bronze → {D}{dst}{R}")
-    if outliers:
-        print(f"  {RE}{B}⚠  {len(outliers)} outlier(s){R}")
-    print()
-
-# ── EVENT HANDLER ─────────────────────────────────────────────────────────────
-
-class ApartmentHandler(FileSystemEventHandler):
-
-    def on_created(self, event):
-        if event.is_directory:
-            return
-
-        path = Path(event.src_path)
-        if path.suffix.lower() != ".json":
-            return
-
-        time.sleep(1)  # let SMB finish writing
-
-        apt = identify_apartment(path.name)
-        if not apt:
-            log.warning(f"Unknown apartment: {path.name}")
-            return
-
+        print(f"  {YE}>{R} {name} -- {desc}")
         try:
-            with open(path, encoding="utf-8") as f:
-                payload = json.load(f)
+            result = subprocess.run(
+                [sys.executable, "-u", str(script)],
+                cwd=str(PROJECT_ROOT),
+                timeout=7200,
+            )
+            if result.returncode == 0:
+                print(f"  {GR}v{R} {name} done\n")
+            else:
+                print(f"  {RE}x {name} exited with code {result.returncode}{R}\n")
+        except subprocess.TimeoutExpired:
+            print(f"  {RE}x {name} timed out (2h){R}\n")
         except Exception as e:
-            log.error(f"Read failed — {path.name}: {e}")
-            return
+            print(f"  {RE}x {name} error: {e}{R}\n")
 
-        ts  = parse_timestamp(payload.get("datetime", ""))
-        dst = bronze_path(apt, ts, path.name)
+    elapsed = time.monotonic() - t_start
+    return elapsed
 
-        try:
-            shutil.copy2(str(path), str(dst))
-        except Exception as e:
-            log.error(f"Bronze copy failed: {e}")
-            return
 
-        rows = flatten(apt, payload, ts)
-        print_summary(apt, path.name, dst, ts, rows)
-
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+# -- MAIN ----------------------------------------------------------------------
 
 def run():
     if not SMB_PATH.exists():
@@ -277,27 +162,154 @@ def run():
             "Is Z: mounted? Check File Explorer."
         )
 
-    BRONZE_ROOT.mkdir(parents=True, exist_ok=True)
+    print(f"\n{B}watcher -- Pipeline Loop{R}")
+    print(f"{D}SMB      : {SMB_PATH}{R}")
+    print(f"{D}Bronze   : {(PROJECT_ROOT / BRONZE_ROOT).resolve()}{R}")
+    print(f"{D}Interval : {INTERVAL_SECS}s{R}")
+    print(f"{D}Pipeline : bulk_to_bronze -> flatten_sensors{R}")
+    print(f"{D}Check    : prediction (nightly full scan at {NIGHTLY_HOUR:02d}:00){R}")
+    print(f"{D}Ctrl+C to stop{R}\n")
 
-    print(f"\n{B}fast_flow — SMB → Bronze{R}")
-    print(f"{D}Source  : {SMB_PATH}{R}")
-    print(f"{D}Bronze  : {BRONZE_ROOT.resolve()}{R}")
-    print(f"{D}Polling every 10s — Ctrl+C to stop{R}\n")
+    # Find starting point
+    print(f"  {D}Finding newest Bronze file...{R}", end=" ")
+    last_known = get_newest_bronze_filename()
+    if last_known:
+        print(f"{GR}{last_known}{R}")
+    else:
+        print(f"{YE}none -- first run will do full scan{R}")
 
-    handler  = ApartmentHandler()
-    observer = PollingObserver(timeout=10)
-    observer.schedule(handler, path=str(SMB_PATH), recursive=False)
-    observer.start()
+    run_count = 0
+    skip_count = 0
+    pipeline_count = 0
+    total_time = 0
+    last_run_str = "never"
+    nightly_done_today = False
 
     try:
         while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print(f"\n{D}Stopping...{R}")
-        observer.stop()
+            run_count += 1
+            now = time.strftime("%H:%M:%S")
+            current_hour = int(time.strftime("%H"))
 
-    observer.join()
-    print(f"{D}Done.{R}\n")
+            # Reset nightly flag at 1am
+            if current_hour == NIGHTLY_HOUR + 1:
+                nightly_done_today = False
+
+            # Nightly safety scan
+            if current_hour == NIGHTLY_HOUR and not nightly_done_today:
+                nightly_done_today = True
+                print(f"\n  {YE}[{now}] NIGHTLY SCAN -- full os.scandir check{R}", end=" ", flush=True)
+                t_check = time.monotonic()
+                newest_smb = get_newest_smb_filename()
+                check_time = time.monotonic() - t_check
+
+                if newest_smb and (last_known is None or newest_smb > last_known):
+                    print(f"{GR}found newer: {newest_smb} ({check_time:.0f}s) -- running pipeline{R}")
+                    # Run pipeline
+                    pipeline_count += 1
+                    print(f"\n{CY}{B}{'=' * 56}{R}")
+                    print(f"{CY}{B}  PIPELINE #{pipeline_count} (nightly) -- {now}{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}\n")
+
+                    elapsed = run_pipeline()
+                    total_time += elapsed
+                    last_known = get_newest_bronze_filename()
+                    last_run_str = f"{time.strftime('%H:%M:%S')} ({elapsed:.0f}s, nightly)"
+
+                    print(f"{CY}{B}{'=' * 56}{R}")
+                    print(f"{GR}{B}  PIPELINE #{pipeline_count} COMPLETE -- {elapsed:.0f}s{R}")
+                    if last_known:
+                        print(f"{D}  newest: {last_known}{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}")
+                else:
+                    print(f"{D}all caught up ({check_time:.0f}s){R}")
+
+                # Continue to normal countdown
+                for remaining in range(INTERVAL_SECS, 0, -1):
+                    mins, secs = divmod(remaining, 60)
+                    print(
+                        f"\r  {D}[{time.strftime('%H:%M:%S')}] idle -- next in {mins:02d}:{secs:02d}"
+                        f"  |  pipelines: {pipeline_count}  skipped: {skip_count}"
+                        f"  |  last: {last_run_str}{R}   ",
+                        end="", flush=True,
+                    )
+                    time.sleep(1)
+                print()
+                continue
+
+            # Normal cycle: predict next files
+            if last_known is None:
+                # No baseline -- need full scan first time
+                print(f"\n  {YE}[{now}] No baseline -- full scan{R}", end=" ", flush=True)
+                t_check = time.monotonic()
+                newest_smb = get_newest_smb_filename()
+                check_time = time.monotonic() - t_check
+
+                if newest_smb:
+                    print(f"{GR}{newest_smb} ({check_time:.0f}s){R}")
+                    pipeline_count += 1
+                    print(f"\n{CY}{B}{'=' * 56}{R}")
+                    print(f"{CY}{B}  PIPELINE #{pipeline_count} -- {now}{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}\n")
+
+                    elapsed = run_pipeline()
+                    total_time += elapsed
+                    last_known = get_newest_bronze_filename()
+                    last_run_str = f"{time.strftime('%H:%M:%S')} ({elapsed:.0f}s)"
+
+                    print(f"{CY}{B}{'=' * 56}{R}")
+                    print(f"{GR}{B}  PIPELINE #{pipeline_count} COMPLETE -- {elapsed:.0f}s{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}")
+                else:
+                    print(f"{D}no files on SMB{R}")
+            else:
+                # Predict and check
+                predicted = predict_next_files(last_known)
+                print(f"\n  {D}[{now}] Checking {predicted[0][:20]}...{R}", end=" ", flush=True)
+                t_check = time.monotonic()
+                found = check_predicted(predicted)
+                check_time = time.monotonic() - t_check
+
+                if found:
+                    print(f"{GR}+{len(found)} new ({check_time:.2f}s){R}")
+
+                    pipeline_count += 1
+                    print(f"\n{CY}{B}{'=' * 56}{R}")
+                    print(f"{CY}{B}  PIPELINE #{pipeline_count} -- {now}{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}\n")
+
+                    elapsed = run_pipeline()
+                    total_time += elapsed
+                    last_known = get_newest_bronze_filename()
+                    last_run_str = f"{time.strftime('%H:%M:%S')} ({elapsed:.0f}s)"
+
+                    print(f"{CY}{B}{'=' * 56}{R}")
+                    print(f"{GR}{B}  PIPELINE #{pipeline_count} COMPLETE -- {elapsed:.0f}s{R}")
+                    print(f"{D}  checks: {run_count}  |  pipelines: {pipeline_count}  |  skipped: {skip_count}{R}")
+                    if last_known:
+                        print(f"{D}  newest: {last_known}{R}")
+                    print(f"{CY}{B}{'=' * 56}{R}")
+                else:
+                    skip_count += 1
+                    print(f"{D}not yet ({check_time:.2f}s){R}")
+
+            # Countdown
+            for remaining in range(INTERVAL_SECS, 0, -1):
+                mins, secs = divmod(remaining, 60)
+                print(
+                    f"\r  {D}[{time.strftime('%H:%M:%S')}] idle -- next in {mins:02d}:{secs:02d}"
+                    f"  |  pipelines: {pipeline_count}  skipped: {skip_count}"
+                    f"  |  last: {last_run_str}{R}   ",
+                    end="", flush=True,
+                )
+                time.sleep(1)
+            print()
+
+    except KeyboardInterrupt:
+        print(f"\n\n{B}{'-' * 56}{R}")
+        print(f"{D}Stopped after {run_count} checks ({pipeline_count} pipelines, {skip_count} skipped){R}")
+        print(f"{D}Total pipeline time: {total_time / 60:.1f}min{R}")
+        print(f"{B}{'-' * 56}{R}\n")
 
 
 if __name__ == "__main__":

@@ -75,7 +75,7 @@ storage/bronze/
 
 ## 6. Run the ETL pipeline
 
-### Step 1 — Flatten sensor JSON → Silver
+### Step 1 — Flatten sensor JSON -> Silver
 
 ```bash
 python etl/bronze_to_silver/flatten_sensors.py
@@ -83,7 +83,7 @@ python etl/bronze_to_silver/flatten_sensors.py
 
 This processes all JSON files from both apartments into `silver.sensor_events` (~15M rows, ~3.5 hours on first run). It's resume-capable via watermark — safe to interrupt and restart.
 
-### Step 2 — Import MySQL static data → Silver
+### Step 2 — Import MySQL static data -> Silver
 
 ```bash
 python etl/bronze_to_silver/import_mysql_to_silver.py
@@ -91,7 +91,7 @@ python etl/bronze_to_silver/import_mysql_to_silver.py
 
 Imports dimension and reference tables from the school MySQL DB into the Silver schema. Takes a few seconds.
 
-### Step 3 — Weather CSV → Silver (Sacha)
+### Step 3 — Weather CSV -> Silver (Sacha)
 
 ```bash
 python etl/bronze_to_silver/clean_weather.py
@@ -99,7 +99,7 @@ python etl/bronze_to_silver/clean_weather.py
 
 > Not yet implemented — assigned to Sacha.
 
-### Step 4 — Silver → Gold aggregation
+### Step 4 — Silver -> Gold aggregation
 
 > Sprint 3 — not yet implemented.
 
@@ -146,13 +146,13 @@ ORDER BY outliers DESC;
 ## Troubleshooting
 
 **`ModuleNotFoundError: No module named 'pymysql'`**
-→ `pip install pymysql`
+-> `pip install pymysql`
 
 **`Unknown database 'appartments'`**
-→ The MySQL database name is `pidb`, not `Appartments`. Check your `MYSQL_URL`.
+-> The MySQL database name is `pidb`, not `Appartments`. Check your `MYSQL_URL`.
 
 **Flatten script is slow**
-→ First run processes ~243k files (~3.5h). Subsequent runs only process new files thanks to the watermark table.
+-> First run processes ~243k files (~3.5h). Subsequent runs only process new files thanks to the watermark table.
 
 **Can't see tables in TablePlus**
-→ You're probably looking at the `public` schema. Switch to `silver` schema.
+-> You're probably looking at the `public` schema. Switch to `silver` schema.

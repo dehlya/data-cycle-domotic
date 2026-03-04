@@ -24,7 +24,7 @@ load_dotenv()
 
 # ── Config ──────────────────────────────────────────────────────────────────
 DB_URL    = os.getenv("DB_URL")  # local Postgres
-MYSQL_URL = os.getenv("MYSQL_URL", "mysql+pymysql://student:widSN3Ey35fWVOxY@10.130.25.152:3306/Appartments")
+MYSQL_URL = os.getenv("MYSQL_URL", "mysql+pymysql://student:password@10.130.25.152:3306/Appartments")
 
 # Tables to import: (mysql_table, silver_table, description)
 TABLES = [
@@ -46,15 +46,15 @@ TABLES = [
 ]
 
 # Skipped tables (with reasons):
-# - users              → GDPR (names, emails, passwords, phone numbers)
-# - actions            → gamification, not relevant for analytics
-# - achievements       → gamification
-# - badges             → gamification
-# - events             → app-generated alerts, not raw sensor data
-# - eventsgeneric      → energy saving tips, not sensor data
-# - eventsignore       → app config
-# - categories         → only useful with events table
-# - userrelationships  → app config
+# - users              -> GDPR (names, emails, passwords, phone numbers)
+# - actions            -> gamification, not relevant for analytics
+# - achievements       -> gamification
+# - badges             -> gamification
+# - events             -> app-generated alerts, not raw sensor data
+# - eventsgeneric      -> energy saving tips, not sensor data
+# - eventsignore       -> app config
+# - categories         -> only useful with events table
+# - userrelationships  -> app config
 
 R = "\033[0m"; B = "\033[1m"; D = "\033[2m"; GR = "\033[32m"; RE = "\033[31m"; YL = "\033[33m"
 
@@ -69,7 +69,7 @@ def run():
     pg_engine = create_engine(DB_URL)
     my_engine = create_engine(MYSQL_URL)
 
-    print(f"\n{B}import_mysql_to_silver — MySQL → Silver{R}")
+    print(f"\n{B}import_mysql_to_silver — MySQL -> Silver{R}")
     print(f"{D}Source : {MYSQL_URL.split('@')[-1]}{R}")
     print(f"{D}Target : {DB_URL.split('@')[-1]}{R}\n")
 
@@ -100,7 +100,7 @@ def run():
 
             count = len(rows)
             if count == 0:
-                print(f"  {D}○ {source_table} → {silver_table} (empty){R}")
+                print(f"  {D}○ {source_table} -> {silver_table} (empty){R}")
                 continue
 
             # Drop + recreate in silver schema (TEXT columns for safe import)
@@ -126,7 +126,7 @@ def run():
 
             total_rows += count
             imported += 1
-            print(f"  {GR}✓{R} {source_table} → silver.{silver_table}  {D}({count:,} rows) — {notes}{R}")
+            print(f"  {GR}✓{R} {source_table} -> silver.{silver_table}  {D}({count:,} rows) — {notes}{R}")
 
         except Exception as e:
             print(f"  {RE}✗ {source_table} — {e}{R}")

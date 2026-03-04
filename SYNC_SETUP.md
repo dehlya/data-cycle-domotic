@@ -1,11 +1,11 @@
 # GitHub ↔ Notion Sync
 
-Automatically syncs GitHub Issues → Notion Backlog DB and GitHub Milestones → Notion Sprints DB.
+Automatically syncs GitHub Issues -> Notion Backlog DB and GitHub Milestones -> Notion Sprints DB.
 
 ## How it works
 
 - **Auto sync** — triggers on every issue or milestone create/edit/close/reopen
-- **Manual sync** — trigger from GitHub Actions tab → "Sync GitHub → Notion" → Run workflow
+- **Manual sync** — trigger from GitHub Actions tab -> "Sync GitHub -> Notion" -> Run workflow
 
 ## Setup
 
@@ -16,7 +16,7 @@ sync.py
 ```
 
 ### 2. Add GitHub repo secrets
-Go to your repo → Settings → Secrets and variables → Actions → New repository secret
+Go to your repo -> Settings -> Secrets and variables -> Actions -> New repository secret
 
 | Secret name | Value |
 |---|---|
@@ -26,11 +26,11 @@ Go to your repo → Settings → Secrets and variables → Actions → New repos
 | `GH_PAT` | Your GitHub Personal Access Token (`repo` + `workflow` scopes) |
 
 ### 3. Connect the Notion integration to your DBs
-In Notion → open each DB → `...` → Connections → add your integration
+In Notion -> open each DB -> `...` -> Connections -> add your integration
 
 ## Field mapping
 
-### Issues → Backlog DB
+### Issues -> Backlog DB
 | GitHub | Notion |
 |---|---|
 | Title | Name |
@@ -42,7 +42,7 @@ In Notion → open each DB → `...` → Connections → add your integration
 | Milestone | Sprint (relation) |
 | html_url | Github URL (dedup key) |
 
-### Milestones → Sprints DB
+### Milestones -> Sprints DB
 | GitHub | Notion |
 |---|---|
 | Title | Name |
