@@ -1,9 +1,9 @@
-# Daily sFTP download — pulls today's weather CSV from Meteo folder, writes to Bronze
-
 import os
 import logging
 from datetime import datetime
 import paramiko
+import time
+import json
 from dotenv import load_dotenv
 from pathlib import Path
 from dateutil.relativedelta import relativedelta
@@ -17,63 +17,80 @@ SFTP_USER     = os.getenv("SFTP_USER")
 SFTP_PASSWORD = os.getenv("SFTP_PASSWORD")
 SFTP_PATH     = os.getenv("SFTP_PATH")
 
-LOCAL_BASE_PATH = Path.home() / "Desktop" / "Bronze" / "Weather"
+BRONZE_ROOT   = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
+STATE         = Path("weather_missing_files.json")
+
+MAX_RETRIES = 3
+RETRY_DELAY = 600
 
 # ─── LOGGING ───
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("weather_sftp")
 
 
+def bronze_path(file):
+    d = datetime.strptime(file[5:15], "%Y-%m-%d")
+    p = BRONZE_ROOT / "weather" / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
+    p.mkdir(parents=True, exist_ok=True)
+    return p / file
 
-# ─── JOB ───
-def fetchTodaysFile():
-    
 
-    # Because start in 2023
-    date_minus3 = datetime.today() - relativedelta(years=3)
+def connect():
+    for i in range(2):
+        try:
+            t = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+            t.connect(username=SFTP_USER, password=SFTP_PASSWORD)
+            return paramiko.SFTPClient.from_transport(t), t
+        except Exception as e:
+            if i == 0:
+                log.warning(f"SFTP error → retry in 10min: {e}")
+                time.sleep(RETRY_DELAY)
+            else:
+                raise
 
-    expected_filename = f"Pred_{date_minus3:%Y-%m-%d}.csv"
-    remote_file_path = f"{SFTP_PATH}/{expected_filename}"
 
-    log.info(f"Connecting to sFTP to find {expected_filename}...")
+def run():
+
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    state.setdefault(f"Pred_{datetime.today():%Y-%m-%d}.csv", 0)
 
     try:
-        transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
-        transport.connect(username=SFTP_USER, password=SFTP_PASSWORD)
-        sftp = paramiko.SFTPClient.from_transport(transport)
+        sftp, t = connect()
+    except:
+        STATE.write_text(json.dumps(state, indent=2))
+        return
+
+    next_state = {}
+
+    for file, retries in state.items():
+
+        local = bronze_path(file)
+
+        if local.exists():
+            log.info(f"skip {file}")
+            continue
 
         try:
-            sftp.stat(remote_file_path)  # File exist?
+            sftp.get(f"{SFTP_PATH}/{file}", str(local))
+            log.info(f"downloaded {file}")
+
         except FileNotFoundError:
-            log.warning(f"Today's file not found: {expected_filename}")
-            sftp.close()
-            transport.close()
-            return
+            retries += 1
+            if retries < MAX_RETRIES:
+                next_state[file] = retries
+            else:
+                log.error(f"abort {file}")
 
-        local_dir = Path(
-            LOCAL_BASE_PATH,
-            str(date_minus3.year),
-            f"{date_minus3.month:02d}",
-            f"{date_minus3.day:02d}"
-        )
-        local_dir.mkdir(parents=True, exist_ok=True)
-        local_file_path = local_dir / expected_filename
+        except Exception as e:
+            log.error(f"{file} error: {e}")
+            retries += 1
+            if retries < MAX_RETRIES:
+                next_state[file] = retries
 
-        # Download
-        log.info(f"Downloading {expected_filename} to {local_file_path}")
-        sftp.get(remote_file_path, str(local_file_path))
-        log.info("Download completed.")
-
-        sftp.close()
-        transport.close()
-
-    except Exception as e:
-        log.error(f"SFTP error: {e}")
+    STATE.write_text(json.dumps(next_state, indent=2))
+    sftp.close()
+    t.close()
 
 
 if __name__ == "__main__":
-    fetchTodaysFile()
+    run()
