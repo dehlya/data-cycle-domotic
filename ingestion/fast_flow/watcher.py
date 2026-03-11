@@ -7,7 +7,9 @@ Checks with a single .exists() call -- milliseconds, no scanning.
 Nightly safety net: one full os.scandir at midnight to catch
 any files that prediction might have missed.
 
-Usage: python ingestion/fast_flow/watcher.py
+Usage:
+  python ingestion/fast_flow/watcher.py          # normal loop
+  python ingestion/fast_flow/watcher.py --scan    # force full scan, run pipeline, exit
 
 Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
@@ -61,21 +63,26 @@ def dt_to_filename(dt, apartment):
     return f"{dt.strftime('%d.%m.%Y %H%M')}_{apartment}_received.json"
 
 
+def is_newer(filename_a, filename_b):
+    """Compare two filenames by parsed date, not alphabetically."""
+    dt_a = parse_filename_to_dt(filename_a)
+    dt_b = parse_filename_to_dt(filename_b)
+    if dt_a is None or dt_b is None:
+        return filename_a > filename_b  # fallback to string
+    return dt_a > dt_b
+
+
 def predict_next_files(last_filename):
-    """
-    Given the last known filename, predict the next expected files.
-    Files come every minute, two apartments. Returns list of predicted names.
-    """
+    """Predict the next expected files (1 minute later, both apartments)."""
     dt = parse_filename_to_dt(last_filename)
     if dt is None:
         return []
-
     next_dt = dt + timedelta(minutes=1)
     return [dt_to_filename(next_dt, apt) for apt in APARTMENTS_SMB]
 
 
 def check_predicted(predicted_files):
-    """Check if any predicted files exist on SMB. Returns list of found files."""
+    """Check if any predicted files exist on SMB."""
     found = []
     for name in predicted_files:
         if (SMB_PATH / name).exists():
@@ -84,36 +91,43 @@ def check_predicted(predicted_files):
 
 
 def get_newest_bronze_filename():
-    """Find the newest filename in Bronze by checking newest folders."""
+    """Find the newest filename in Bronze by parsed date (not string sort)."""
     bronze = PROJECT_ROOT / BRONZE_ROOT
     if not bronze.exists():
         return None
     newest = None
+    newest_dt = None
     for apt in ["jimmy", "jeremie"]:
         apt_path = bronze / apt
         if not apt_path.exists():
             continue
+        # Walk newest year/month/day/hour folders
         hour_folders = sorted(apt_path.glob("*/*/*/*"), reverse=True)
         for folder in hour_folders:
             if not folder.is_dir():
                 continue
-            files = sorted(folder.glob("*.json"), reverse=True)
-            if files:
-                name = files[0].name
-                if newest is None or name > newest:
-                    newest = name
-                break
+            files = list(folder.glob("*.json"))
+            for f in files:
+                dt = parse_filename_to_dt(f.name)
+                if dt is not None and (newest_dt is None or dt > newest_dt):
+                    newest = f.name
+                    newest_dt = dt
+            if newest_dt is not None:
+                break  # only check newest folder per apartment
     return newest
 
 
 def get_newest_smb_filename():
-    """Full os.scandir pass -- used only for nightly safety check."""
+    """Full os.scandir pass -- compares by parsed date, not string."""
     newest = None
+    newest_dt = None
     try:
         for entry in os.scandir(SMB_PATH):
             if entry.is_file(follow_symlinks=False) and entry.name.endswith(".json"):
-                if newest is None or entry.name > newest:
+                dt = parse_filename_to_dt(entry.name)
+                if dt is not None and (newest_dt is None or dt > newest_dt):
                     newest = entry.name
+                    newest_dt = dt
     except Exception as e:
         print(f"  {RE}SMB scan error: {e}{R}")
     return newest
@@ -174,9 +188,29 @@ def run():
     print(f"  {D}Finding newest Bronze file...{R}", end=" ")
     last_known = get_newest_bronze_filename()
     if last_known:
-        print(f"{GR}{last_known}{R}")
+        dt = parse_filename_to_dt(last_known)
+        print(f"{GR}{last_known} ({dt}){R}")
     else:
         print(f"{YE}none -- first run will do full scan{R}")
+
+    # --scan flag: force full scan, run pipeline once, exit
+    if "--scan" in sys.argv:
+        print(f"\n  {YE}FORCED SCAN -- scanning SMB...{R}", end=" ", flush=True)
+        t0 = time.monotonic()
+        newest_smb = get_newest_smb_filename()
+        scan_time = time.monotonic() - t0
+        print(f"newest SMB: {newest_smb} ({scan_time:.0f}s)")
+
+        if newest_smb and (last_known is None or is_newer(newest_smb, last_known)):
+            print(f"  {GR}New data found -- running pipeline{R}\n")
+            run_pipeline()
+            last_known = get_newest_bronze_filename()
+            print(f"\n  {GR}Done. Newest Bronze: {last_known}{R}\n")
+        else:
+            print(f"  {D}Bronze is up to date. Running pipeline anyway...{R}\n")
+            run_pipeline()
+            print(f"\n  {GR}Done.{R}\n")
+        return
 
     run_count = 0
     skip_count = 0
@@ -203,9 +237,8 @@ def run():
                 newest_smb = get_newest_smb_filename()
                 check_time = time.monotonic() - t_check
 
-                if newest_smb and (last_known is None or newest_smb > last_known):
+                if newest_smb and (last_known is None or is_newer(newest_smb, last_known)):
                     print(f"{GR}found newer: {newest_smb} ({check_time:.0f}s) -- running pipeline{R}")
-                    # Run pipeline
                     pipeline_count += 1
                     print(f"\n{CY}{B}{'=' * 56}{R}")
                     print(f"{CY}{B}  PIPELINE #{pipeline_count} (nightly) -- {now}{R}")
@@ -224,7 +257,6 @@ def run():
                 else:
                     print(f"{D}all caught up ({check_time:.0f}s){R}")
 
-                # Continue to normal countdown
                 for remaining in range(INTERVAL_SECS, 0, -1):
                     mins, secs = divmod(remaining, 60)
                     print(
@@ -239,7 +271,6 @@ def run():
 
             # Normal cycle: predict next files
             if last_known is None:
-                # No baseline -- need full scan first time
                 print(f"\n  {YE}[{now}] No baseline -- full scan{R}", end=" ", flush=True)
                 t_check = time.monotonic()
                 newest_smb = get_newest_smb_filename()
