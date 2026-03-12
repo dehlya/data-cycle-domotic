@@ -25,8 +25,12 @@ log = logging.getLogger("weather_sftp")
 
 
 def bronze_path(filename):
-    # Expected format: Pred_YYYY-MM-DD.csv
-    dt = datetime.strptime(filename[5:15], "%Y-%m-%d")
+    try:
+        # Expected format: Pred_YYYY-MM-DD.csv
+        dt = datetime.strptime(filename[5:15], "%Y-%m-%d")
+    except Exception:
+        log.warning(f"Skipping unexpected filename: {filename}")
+        return None
     path = BRONZE_ROOT / "weather" / f"{dt:%Y}" / f"{dt:%m}" / f"{dt:%d}"
     path.mkdir(parents=True, exist_ok=True)
     return path / filename
@@ -66,6 +70,9 @@ def run():
             # 4. Create local path (Bronze)
             #    Ex: Pred_2023-08-18.csv -> bronze/weather/2023/08/18/Pred_2023-08-18.csv
             local = bronze_path(filename)
+            if local is None:
+                skipped += 1
+                continue
             
             # 5. If it already exist -> skip
             if local.exists():
