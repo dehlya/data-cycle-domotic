@@ -81,7 +81,7 @@ BOUNDS = {
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # timestamp
-    df["timestamp"] = pd.to_datetime(df["Time"], errors="coerce")
+    df["timestamp"] = pd.to_datetime(df["Time"], errors="coerce", utc=True)
 
     # site clean
     df["site"] = df["Site"].str.replace('"', "").str.strip()
@@ -94,9 +94,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # numeric value
     df["value"] = pd.to_numeric(df["Value"], errors="coerce")
-
-    # convert precipitation
-    df.loc[df["Unit"] == "Kg/m2", "value"] = df["value"]
+    df.loc[df["value"] == -99999.0, "value"] = None
 
     # remove nulls
     df = df.dropna(subset=["timestamp", "value"])
@@ -106,7 +104,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         index=["timestamp", "site"],
         columns="field",
         values="value",
-        aggfunc="mean"
+        aggfunc="first"
     ).reset_index()
 
     # ensure all columns exist
