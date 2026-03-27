@@ -87,7 +87,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df["site"] = df["Site"].str.replace('"', "").str.strip()
 
     # keep relevant measurements
-    df = df[df["Measurement"].isin(MEASURE_MAP.keys())]
+    df = df[df["Measurement"].isin(MEASURE_MAP.keys())].copy()
 
     # rename measurement
     df["field"] = df["Measurement"].map(MEASURE_MAP)
@@ -122,6 +122,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 # ─── SQL UPSERT ───
 
+# Assumes that create_silver.py has been run and silver.weather_clean exists
 UPSERT_SQL = text("""
 INSERT INTO silver.weather_clean
 (timestamp, site, temperature_c, humidity_pct, precipitation_mm, radiation_wm2)
@@ -142,7 +143,7 @@ def upsert(engine, df):
     rows = df.to_dict(orient="records")
 
     with engine.begin() as conn:
-        conn.execute(UPSERT_SQL, rows)
+        conn.execute(text(UPSERT_SQL), rows)
 
 
 def find_csv(watermark):
@@ -151,7 +152,7 @@ def find_csv(watermark):
 
     all_files = list(root.rglob("*.csv"))
 
-    new_files = [f for f in all_files if str(f) not in watermark]
+    new_files = [f for f in all_files if f.name not in watermark]
     
     return new_files
 
@@ -167,11 +168,9 @@ def run():
     engine = create_engine(DB_URL)
 
     log.info("Loading watermark...")
-
     watermark = load_watermark(engine)
 
     files = find_csv(watermark)
-
     log.info(f"{len(files)} new files to process")
 
     total_rows = 0
@@ -181,23 +180,21 @@ def run():
     for i, path in enumerate(files, 1):
 
         log.info(f"Processing {path.name}")
-
-        df = pd.read_csv(path)
-
-        df_clean = clean_dataframe(df)
-
-        upsert(engine, df_clean)
-
-        total_rows += len(df_clean)
-
-        processed_files.append(str(path))
+        try:
+            df = pd.read_csv(path)
+            df_clean = clean_dataframe(df)
+            upsert(engine, df_clean)
+            total_rows += len(df_clean)
+            # mark as done after successful processing
+            mark_done(engine, [path.name])
+        except Exception as e:
+            log.warning(f"Failed to process {path.name}: {e}")
         
         if i % 10 == 0:
             log.info(f"{i}/{len(files)} files processed")
 
 
-    mark_done(engine, processed_files)
-
+    engine.dispose()
     log.info(f"Done — {total_rows} rows inserted")
 
 
