@@ -25,7 +25,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("clean_weather")
 
 
-# ─── WATERMARK ───
+# ─── DDL ───
+
+WEATHER_CLEAN_DDL = """
+CREATE TABLE IF NOT EXISTS silver.weather_clean (
+    id               BIGSERIAL PRIMARY KEY,
+    timestamp        TIMESTAMPTZ  NOT NULL,
+    site             VARCHAR(50),
+    temperature_c    FLOAT,
+    humidity_pct     FLOAT,
+    precipitation_mm FLOAT,
+    radiation_wm2    FLOAT,
+    UNIQUE (timestamp, site)
+);
+CREATE INDEX IF NOT EXISTS idx_weather_clean_timestamp ON silver.weather_clean (timestamp);
+"""
 
 WATERMARK_DDL = """
 CREATE TABLE IF NOT EXISTS silver.weather_watermark (
@@ -35,10 +49,15 @@ CREATE TABLE IF NOT EXISTS silver.weather_watermark (
 """
 
 
-def load_watermark(engine):
-
+def init_db(engine):
+    """Ensure that the necessary tables exist before starting."""
     with engine.begin() as conn:
         conn.execute(text(WATERMARK_DDL))
+        conn.execute(text(WEATHER_CLEAN_DDL))
+
+def load_watermark(engine):
+    """Load processed filenames from watermark table."""
+    with engine.begin() as conn:
         rows = conn.execute(
             text("SELECT filename FROM silver.weather_watermark")
         ).fetchall()
@@ -46,8 +65,8 @@ def load_watermark(engine):
     return {r[0] for r in rows}
 
 
-def mark_done(engine, filenames):
-
+def mark_done(engine, filename):
+    """Insert filename into watermark table."""
     with engine.begin() as conn:
         conn.execute(
             text("""
@@ -55,7 +74,7 @@ def mark_done(engine, filenames):
             VALUES (:f)
             ON CONFLICT DO NOTHING
             """),
-            [{"f": f} for f in filenames]
+            {"f": filename}
         )
 
 
@@ -79,6 +98,8 @@ BOUNDS = {
 # ─── CLEANING ───
 
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean raw weather data and pivot to wide format."""
+
 
     # timestamp
     df["timestamp"] = pd.to_datetime(df["Time"], errors="coerce", utc=True)
@@ -122,8 +143,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 # ─── SQL UPSERT ───
 
-# Assumes that create_silver.py has been run and silver.weather_clean exists
-UPSERT_SQL = text("""
+UPSERT_SQL = """
 INSERT INTO silver.weather_clean
 (timestamp, site, temperature_c, humidity_pct, precipitation_mm, radiation_wm2)
 VALUES
@@ -135,11 +155,11 @@ temperature_c = EXCLUDED.temperature_c,
 humidity_pct = EXCLUDED.humidity_pct,
 precipitation_mm = EXCLUDED.precipitation_mm,
 radiation_wm2 = EXCLUDED.radiation_wm2
-""")
+"""
 
 
 def upsert(engine, df):
-
+    """Upsert cleaned data into silver.weather_clean table."""
     rows = df.to_dict(orient="records")
 
     with engine.begin() as conn:
@@ -147,6 +167,7 @@ def upsert(engine, df):
 
 
 def find_csv(watermark):
+    """Find new CSV files in bronze directory that are not in watermark."""
 
     root = BRONZE_ROOT / "weather"
 
@@ -167,6 +188,9 @@ def run():
 
     engine = create_engine(DB_URL)
 
+    log.info("Initializing database schema...")
+    init_db(engine)
+
     log.info("Loading watermark...")
     watermark = load_watermark(engine)
 
@@ -174,8 +198,6 @@ def run():
     log.info(f"{len(files)} new files to process")
 
     total_rows = 0
-
-    processed_files = []
 
     for i, path in enumerate(files, 1):
 
@@ -185,13 +207,10 @@ def run():
             df_clean = clean_dataframe(df)
             upsert(engine, df_clean)
             total_rows += len(df_clean)
-            # mark as done after successful processing
-            mark_done(engine, [path.name])
+            mark_done(engine, path.name)
         except Exception as e:
             log.warning(f"Failed to process {path.name}: {e}")
         
-        if i % 10 == 0:
-            log.info(f"{i}/{len(files)} files processed")
 
 
     engine.dispose()
