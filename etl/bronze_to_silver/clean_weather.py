@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS silver.weather_clean (
     humidity_pct     FLOAT,
     precipitation_mm FLOAT,
     radiation_wm2    FLOAT,
+    is_outlier       BOOLEAN      DEFAULT FALSE,
     UNIQUE (timestamp, site)
 );
 CREATE INDEX IF NOT EXISTS idx_weather_clean_timestamp ON silver.weather_clean (timestamp);
@@ -104,8 +105,17 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # timestamp
     df["timestamp"] = pd.to_datetime(df["Time"], errors="coerce", utc=True)
 
+    # filter out old data (keep 2023+)
+    df = df[df["timestamp"].dt.year >= 2023].copy()
+
     # site clean
     df["site"] = df["Site"].str.replace('"', "").str.strip()
+
+    # Prediction
+    df["Prediction"] = pd.to_numeric(df["Prediction"], errors="coerce")
+
+    df = df.sort_values(by=["timestamp", "site", "Measurement", "Prediction"])
+    df = df.drop_duplicates(subset=["timestamp", "site", "Measurement"], keep="first")
 
     # keep relevant measurements
     df = df[df["Measurement"].isin(MEASURE_MAP.keys())].copy()
@@ -115,10 +125,9 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # numeric value
     df["value"] = pd.to_numeric(df["Value"], errors="coerce")
-    df.loc[df["value"] == -99999.0, "value"] = None
 
-    # remove nulls
-    df = df.dropna(subset=["timestamp", "value"])
+    # Sentinel value for missing data is -99999.0, convert to null
+    df.loc[df["value"] == -99999.0, "value"] = None
 
     # pivot long → wide
     df = df.pivot_table(
@@ -134,8 +143,10 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = None
 
     # outlier filtering
+    df["is_outlier"] = False
     for field, (lo, hi) in BOUNDS.items():
-        df.loc[(df[field] < lo) | (df[field] > hi), field] = None
+        mask = (df[field] < lo) | (df[field] > hi)
+        df.loc[mask, "is_outlier"] = True
 
     return df
 
@@ -145,16 +156,17 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 UPSERT_SQL = """
 INSERT INTO silver.weather_clean
-(timestamp, site, temperature_c, humidity_pct, precipitation_mm, radiation_wm2)
+(timestamp, site, temperature_c, humidity_pct, precipitation_mm, radiation_wm2, is_outlier)
 VALUES
-(:timestamp, :site, :temperature_c, :humidity_pct, :precipitation_mm, :radiation_wm2)
+(:timestamp, :site, :temperature_c, :humidity_pct, :precipitation_mm, :radiation_wm2, :is_outlier)
 
 ON CONFLICT (timestamp, site)
 DO UPDATE SET
 temperature_c = EXCLUDED.temperature_c,
 humidity_pct = EXCLUDED.humidity_pct,
 precipitation_mm = EXCLUDED.precipitation_mm,
-radiation_wm2 = EXCLUDED.radiation_wm2
+radiation_wm2 = EXCLUDED.radiation_wm2,
+is_outlier = EXCLUDED.is_outlier
 """
 
 
