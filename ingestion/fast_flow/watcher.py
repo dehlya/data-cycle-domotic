@@ -1,13 +1,14 @@
 """
-watcher.py -- Pipeline loop: SMB -> Bronze -> Silver
-===================================================
-Predicts the next expected filenames based on the last known file.
-Checks with a single .exists() call -- milliseconds, no scanning.
-
-Nightly safety net: one full os.scandir at midnight to catch
-any files that prediction might have missed.
+watcher.py -- Pipeline loop: SMB -> Bronze -> Silver + Weather
+==============================================================
+Fast flow: Predicts the next expected filenames based on the last known file.
+           Checks with a single .exists() call -- milliseconds, no scanning.
+Slow flow: Daily weather pipeline (sFTP download + Bronze -> Silver cleaning).
+Nightly:   Full os.scandir at midnight to catch missed files.
 
 Usage: python ingestion/fast_flow/watcher.py
+       python ingestion/fast_flow/watcher.py --scan      (full SMB scan + pipeline, then exit)
+       python ingestion/fast_flow/watcher.py --weather   (run weather once and exit)
 
 Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
@@ -29,6 +30,8 @@ SMB_PATH      = Path(os.getenv("SMB_PATH", r"Z:\\"))
 BRONZE_ROOT   = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
 INTERVAL_SECS = 60
 NIGHTLY_HOUR  = 0  # midnight
+WEATHER_HOUR  = int(os.getenv("WEATHER_HOUR", "7"))   # hour to trigger weather
+WEATHER_MIN   = int(os.getenv("WEATHER_MIN", "30"))    # minute to trigger weather
 
 # -- ANSI COLORS ---------------------------------------------------------------
 
@@ -153,9 +156,59 @@ def run_pipeline():
     return elapsed
 
 
+def run_weather_pipeline():
+    """Run the slow flow: weather download from sFTP then clean into Silver."""
+    t_start = time.monotonic()
+
+    steps = [
+        ("weather_download", PROJECT_ROOT / "ingestion" / "slow_flow" / "weather_download.py", "sFTP -> Bronze"),
+        ("clean_weather",    PROJECT_ROOT / "etl" / "bronze_to_silver" / "clean_weather.py",   "Bronze -> Silver"),
+    ]
+
+    for name, script, desc in steps:
+        if not script.exists():
+            print(f"  {RE}x {name} -- script not found: {script}{R}")
+            continue
+
+        print(f"  {YE}>{R} {name} -- {desc}")
+        try:
+            result = subprocess.run(
+                [sys.executable, "-u", str(script)],
+                cwd=str(PROJECT_ROOT),
+                timeout=3600,
+            )
+            if result.returncode == 0:
+                print(f"  {GR}v{R} {name} done\n")
+            else:
+                print(f"  {RE}x {name} exited with code {result.returncode}{R}\n")
+        except subprocess.TimeoutExpired:
+            print(f"  {RE}x {name} timed out (1h){R}\n")
+        except Exception as e:
+            print(f"  {RE}x {name} error: {e}{R}\n")
+
+    elapsed = time.monotonic() - t_start
+    return elapsed
+
+
 # -- MAIN ----------------------------------------------------------------------
 
 def run():
+    # Manual triggers
+    if "--weather" in sys.argv:
+        print(f"\n{B}watcher -- Manual Weather Pipeline{R}\n")
+        elapsed = run_weather_pipeline()
+        print(f"\n{GR}{B}  Weather pipeline done in {elapsed:.0f}s{R}\n")
+        return
+
+    if "--scan" in sys.argv:
+        print(f"\n{B}watcher -- Manual Full Scan{R}\n")
+        newest_smb = get_newest_smb_filename()
+        if newest_smb:
+            print(f"  {GR}Newest on SMB: {newest_smb}{R}\n")
+        elapsed = run_pipeline()
+        print(f"\n{GR}{B}  Pipeline done in {elapsed:.0f}s{R}\n")
+        return
+
     if not SMB_PATH.exists():
         raise FileNotFoundError(
             f"SMB path not found: {SMB_PATH}\n"
@@ -166,8 +219,10 @@ def run():
     print(f"{D}SMB      : {SMB_PATH}{R}")
     print(f"{D}Bronze   : {(PROJECT_ROOT / BRONZE_ROOT).resolve()}{R}")
     print(f"{D}Interval : {INTERVAL_SECS}s{R}")
-    print(f"{D}Pipeline : bulk_to_bronze -> flatten_sensors{R}")
-    print(f"{D}Check    : prediction (nightly full scan at {NIGHTLY_HOUR:02d}:00){R}")
+    print(f"{D}Fast flow: bulk_to_bronze -> flatten_sensors{R}")
+    print(f"{D}Slow flow: weather_download -> clean_weather (daily at {WEATHER_HOUR:02d}:{WEATHER_MIN:02d}){R}")
+    print(f"{D}Nightly  : full scan at {NIGHTLY_HOUR:02d}:00{R}")
+    print(f"{D}Flags    : --scan (full scan + pipeline) | --weather (weather only){R}")
     print(f"{D}Ctrl+C to stop{R}\n")
 
     # Find starting point
@@ -181,9 +236,11 @@ def run():
     run_count = 0
     skip_count = 0
     pipeline_count = 0
+    weather_count = 0
     total_time = 0
     last_run_str = "never"
     nightly_done_today = False
+    weather_done_today = False
 
     try:
         while True:
@@ -191,9 +248,11 @@ def run():
             now = time.strftime("%H:%M:%S")
             current_hour = int(time.strftime("%H"))
 
-            # Reset nightly flag at 1am
+            # Reset daily flags
             if current_hour == NIGHTLY_HOUR + 1:
                 nightly_done_today = False
+            if current_hour == WEATHER_HOUR + 1:
+                weather_done_today = False
 
             # Nightly safety scan
             if current_hour == NIGHTLY_HOUR and not nightly_done_today:
@@ -229,13 +288,28 @@ def run():
                     mins, secs = divmod(remaining, 60)
                     print(
                         f"\r  {D}[{time.strftime('%H:%M:%S')}] idle -- next in {mins:02d}:{secs:02d}"
-                        f"  |  pipelines: {pipeline_count}  skipped: {skip_count}"
+                        f"  |  pipelines: {pipeline_count}  weather: {weather_count}  skipped: {skip_count}"
                         f"  |  last: {last_run_str}{R}   ",
                         end="", flush=True,
                     )
                     time.sleep(1)
                 print()
                 continue
+
+            # Daily weather pipeline
+            current_min = int(time.strftime("%M"))
+            if current_hour == WEATHER_HOUR and current_min >= WEATHER_MIN and not weather_done_today:
+                weather_done_today = True
+                weather_count += 1
+                print(f"\n{CY}{B}{'=' * 56}{R}")
+                print(f"{CY}{B}  WEATHER #{weather_count} -- {now}{R}")
+                print(f"{CY}{B}{'=' * 56}{R}\n")
+
+                elapsed = run_weather_pipeline()
+
+                print(f"{CY}{B}{'=' * 56}{R}")
+                print(f"{GR}{B}  WEATHER #{weather_count} COMPLETE -- {elapsed:.0f}s{R}")
+                print(f"{CY}{B}{'=' * 56}{R}")
 
             # Normal cycle: predict next files
             if last_known is None:
@@ -298,7 +372,7 @@ def run():
                 mins, secs = divmod(remaining, 60)
                 print(
                     f"\r  {D}[{time.strftime('%H:%M:%S')}] idle -- next in {mins:02d}:{secs:02d}"
-                    f"  |  pipelines: {pipeline_count}  skipped: {skip_count}"
+                    f"  |  pipelines: {pipeline_count}  weather: {weather_count}  skipped: {skip_count}"
                     f"  |  last: {last_run_str}{R}   ",
                     end="", flush=True,
                 )
@@ -307,7 +381,7 @@ def run():
 
     except KeyboardInterrupt:
         print(f"\n\n{B}{'-' * 56}{R}")
-        print(f"{D}Stopped after {run_count} checks ({pipeline_count} pipelines, {skip_count} skipped){R}")
+        print(f"{D}Stopped after {run_count} checks ({pipeline_count} pipelines, {weather_count} weather, {skip_count} skipped){R}")
         print(f"{D}Total pipeline time: {total_time / 60:.1f}min{R}")
         print(f"{B}{'-' * 56}{R}\n")
 
