@@ -21,9 +21,20 @@ WEATHER_MIN_YEAR = int(os.getenv("WEATHER_MIN_YEAR", "2023"))
 
 
 # ─── LOGGING ───
+LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("clean_weather")
+log.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+_sh = logging.StreamHandler()
+_sh.setFormatter(_fmt)
+log.addHandler(_sh)
+
+_fh = logging.FileHandler(LOG_DIR / "clean_weather.log", encoding="utf-8")
+_fh.setFormatter(_fmt)
+log.addHandler(_fh)
 
 
 # ─── DDL ───
@@ -99,16 +110,27 @@ BOUNDS = {
 
 # ─── CLEANING ───
 
+REQUIRED_COLUMNS = {"Time", "Value", "Prediction", "Site", "Measurement", "Unit"}
+
+
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Clean raw weather data and pivot to wide format."""
 
+    n_raw = len(df)
+
+    # validate expected columns
+    missing = REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV missing required columns: {missing}")
 
     # timestamp
     df["timestamp"] = pd.to_datetime(df["Time"], errors="coerce", utc=True)
     df = df.dropna(subset=["timestamp"])
+    n_after_ts = len(df)
 
     # filter out old data (keep 2023+)
     df = df[df["timestamp"].dt.year >= WEATHER_MIN_YEAR].copy()
+    n_after_year = len(df)
 
     # site clean
     df["site"] = df["Site"].str.replace('"', "").str.strip()
@@ -117,10 +139,13 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df["Prediction"] = pd.to_numeric(df["Prediction"], errors="coerce")
 
     df = df.sort_values(by=["timestamp", "site", "Measurement", "Prediction"])
+    n_before_dedup = len(df)
     df = df.drop_duplicates(subset=["timestamp", "site", "Measurement"], keep="first")
+    n_after_dedup = len(df)
 
     # keep relevant measurements
     df = df[df["Measurement"].isin(MEASURE_MAP.keys())].copy()
+    n_after_filter = len(df)
 
     # rename measurement
     df["field"] = df["Measurement"].map(MEASURE_MAP)
@@ -132,6 +157,13 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[df["value"] == -99999.0, "value"] = None
 
     df = df.dropna(subset=["value"])
+    n_after_nulls = len(df)
+
+    log.info(
+        f"  rows: {n_raw} raw → {n_after_ts} valid ts → {n_after_year} after year filter "
+        f"→ {n_after_dedup} deduped ({n_before_dedup - n_after_dedup} dupes) "
+        f"→ {n_after_filter} relevant measures → {n_after_nulls} after null/sentinel removal"
+    )
 
     # pivot long → wide
     df = df.pivot_table(
@@ -146,10 +178,13 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = None
 
-    # outlier filtering
+    # outlier flagging
     df["is_outlier"] = False
     for field, (lo, hi) in BOUNDS.items():
         mask = (df[field] < lo) | (df[field] > hi)
+        n_outliers = mask.sum()
+        if n_outliers > 0:
+            log.info(f"  {field}: {n_outliers} outlier(s) flagged")
         df.loc[mask, "is_outlier"] = True
 
     return df
@@ -217,15 +252,23 @@ def run():
 
     for i, path in enumerate(files, 1):
 
-        log.info(f"Processing {path.name}")
+        log.info(f"[{i}/{len(files)}] Processing {path.name}")
         try:
             df = pd.read_csv(path)
+            if df.empty:
+                log.warning(f"  Skipping {path.name}: file is empty")
+                mark_done(engine, path.name)
+                continue
             df_clean = clean_dataframe(df)
+            if df_clean.empty:
+                log.warning(f"  Skipping {path.name}: no rows after cleaning")
+                mark_done(engine, path.name)
+                continue
             upsert(engine, df_clean)
             total_rows += len(df_clean)
             mark_done(engine, path.name)
         except Exception as e:
-            log.warning(f"Failed to process {path.name}: {e}")
+            log.error(f"  Failed to process {path.name}: {e}")
         
 
 
