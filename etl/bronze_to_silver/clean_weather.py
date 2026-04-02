@@ -17,6 +17,7 @@ load_dotenv()
 
 BRONZE_ROOT = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
 DB_URL = os.getenv("DB_URL")
+WEATHER_MIN_YEAR = int(os.getenv("WEATHER_MIN_YEAR", "2023"))
 
 
 # ─── LOGGING ───
@@ -104,9 +105,10 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # timestamp
     df["timestamp"] = pd.to_datetime(df["Time"], errors="coerce", utc=True)
+    df = df.dropna(subset=["timestamp"])
 
     # filter out old data (keep 2023+)
-    df = df[df["timestamp"].dt.year >= 2023].copy()
+    df = df[df["timestamp"].dt.year >= WEATHER_MIN_YEAR].copy()
 
     # site clean
     df["site"] = df["Site"].str.replace('"', "").str.strip()
@@ -128,6 +130,8 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     # Sentinel value for missing data is -99999.0, convert to null
     df.loc[df["value"] == -99999.0, "value"] = None
+
+    df = df.dropna(subset=["value"])
 
     # pivot long → wide
     df = df.pivot_table(
