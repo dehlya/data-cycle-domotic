@@ -1,3 +1,4 @@
+# Bronze -> Silver — parses raw weather CSV, standardizes and flattens into rows
 
 #Time,                      Value,      Prediction, Site,               Measurement,        Unit
 #2023-01-05 00:00:00+00:00,-99999.0,    00,         Aadorf / Tänikon,   PRED_GLOB_ctrl,     Watt/m2
@@ -5,6 +6,7 @@
 
 import os
 import logging
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -40,18 +42,20 @@ log.addHandler(_fh)
 # ─── DDL ───
 
 WEATHER_CLEAN_DDL = """
-CREATE TABLE IF NOT EXISTS silver.weather_clean (
+CREATE TABLE IF NOT EXISTS silver.weather_forecasts (
     id               BIGSERIAL PRIMARY KEY,
     timestamp        TIMESTAMPTZ  NOT NULL,
-    site             VARCHAR(50),
-    temperature_c    FLOAT,
-    humidity_pct     FLOAT,
-    precipitation_mm FLOAT,
-    radiation_wm2    FLOAT,
+    site             VARCHAR(100),
+    prediction       SMALLINT,
+    prediction_date  DATE,
+    measurement      VARCHAR(50),
+    value            FLOAT,
+    unit             VARCHAR(20),
     is_outlier       BOOLEAN      DEFAULT FALSE,
-    UNIQUE (timestamp, site)
+    UNIQUE (timestamp, site, prediction, prediction_date, measurement)
 );
-CREATE INDEX IF NOT EXISTS idx_weather_clean_timestamp ON silver.weather_clean (timestamp);
+CREATE INDEX IF NOT EXISTS idx_weather_forecasts_timestamp ON silver.weather_forecasts (timestamp);
+CREATE INDEX IF NOT EXISTS idx_weather_forecasts_pred_date ON silver.weather_forecasts (prediction_date);
 """
 
 WATERMARK_DDL = """
@@ -93,18 +97,23 @@ def mark_done(engine, filename):
 
 # ─── MEASUREMENT MAPPING ───
 
-MEASURE_MAP = {
-    "PRED_T_2M_ctrl": "temperature_c",
-    "PRED_RELHUM_2M_ctrl": "humidity_pct",
-    "PRED_TOT_PREC_ctrl": "precipitation_mm",
-    "PRED_GLOB_ctrl": "radiation_wm2",
+RELEVANT_MEASUREMENTS = {
+    "PRED_T_2M_ctrl",
+    "PRED_RELHUM_2M_ctrl",
+    "PRED_TOT_PREC_ctrl",
+    "PRED_GLOB_ctrl",
 }
 
+# Outlier bounds — generous on purpose. These are forecasts, not sensor readings.
+# Extreme weather events must NOT be flagged as outliers.
+# Swiss records: 158mm/1h (Binntal 2024), 41mm/10min (Lausanne 2018).
+# 3h record estimated ~200-250mm. Bound at 500 to catch only model bugs.
+# Ref: meteoswiss.admin.ch/climate/the-climate-of-switzerland/records-and-extremes.html
 BOUNDS = {
-    "temperature_c": (-50, 60),
-    "humidity_pct": (0, 100),
-    "precipitation_mm": (0, 500),
-    "radiation_wm2": (0, 1500),
+    "PRED_T_2M_ctrl": (-50, 60),        # Swiss record: -42°C / 37°C + generous margin
+    "PRED_RELHUM_2M_ctrl": (0, 100),    # physical limit
+    "PRED_TOT_PREC_ctrl": (0, 500),     # 3h extreme ~200-250mm, 500 catches model bugs only
+    "PRED_GLOB_ctrl": (0, 1500),        # solar constant ~1361 W/m², model may overshoot
 }
 
 
@@ -113,8 +122,16 @@ BOUNDS = {
 REQUIRED_COLUMNS = {"Time", "Value", "Prediction", "Site", "Measurement", "Unit"}
 
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean raw weather data and pivot to wide format."""
+def parse_prediction_date(filename):
+    """Extract prediction date from filename: Pred_2023-01-01.csv -> 2023-01-01"""
+    try:
+        return datetime.strptime(filename[5:15], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def clean_dataframe(df: pd.DataFrame, prediction_date) -> pd.DataFrame:
+    """Clean raw weather data. Keep flat — one row per reading. No pivot."""
 
     n_raw = len(df)
 
@@ -128,89 +145,73 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["timestamp"])
     n_after_ts = len(df)
 
-    # filter out old data (keep 2023+)
+    # filter out old data
     df = df[df["timestamp"].dt.year >= WEATHER_MIN_YEAR].copy()
     n_after_year = len(df)
+
+    # keep relevant fields only
+    df = df[df["Measurement"].isin(RELEVANT_MEASUREMENTS)].copy()
+    n_after_filter = len(df)
 
     # site clean
     df["site"] = df["Site"].str.replace('"', "").str.strip()
 
-    # Prediction
-    df["Prediction"] = pd.to_numeric(df["Prediction"], errors="coerce")
-
-    df = df.sort_values(by=["timestamp", "site", "Measurement", "Prediction"])
-    n_before_dedup = len(df)
-    df = df.drop_duplicates(subset=["timestamp", "site", "Measurement"], keep="first")
-    n_after_dedup = len(df)
-
-    # keep relevant measurements
-    df = df[df["Measurement"].isin(MEASURE_MAP.keys())].copy()
-    n_after_filter = len(df)
-
-    # rename measurement
-    df["field"] = df["Measurement"].map(MEASURE_MAP)
+    # prediction number
+    df["prediction"] = pd.to_numeric(df["Prediction"], errors="coerce").astype("Int16")
 
     # numeric value
     df["value"] = pd.to_numeric(df["Value"], errors="coerce")
 
-    # Sentinel value for missing data is -99999.0, convert to null
+    # Remove sentinel values (-99999.0)
     df.loc[df["value"] == -99999.0, "value"] = None
-
     df = df.dropna(subset=["value"])
-    n_after_nulls = len(df)
+    n_after_sentinel = len(df)
 
-    log.info(
-        f"  rows: {n_raw} raw → {n_after_ts} valid ts → {n_after_year} after year filter "
-        f"→ {n_after_dedup} deduped ({n_before_dedup - n_after_dedup} dupes) "
-        f"→ {n_after_filter} relevant measures → {n_after_nulls} after null/sentinel removal"
-    )
+    # prediction date from filename
+    df["prediction_date"] = prediction_date
 
-    # pivot long → wide
-    df = df.pivot_table(
-        index=["timestamp", "site"],
-        columns="field",
-        values="value",
-        aggfunc="first"
-    ).reset_index()
+    # measurement (keep original name — mapping done in Gold)
+    df["measurement"] = df["Measurement"]
 
-    # ensure all columns exist
-    for col in MEASURE_MAP.values():
-        if col not in df.columns:
-            df[col] = None
+    # unit
+    df["unit"] = df["Unit"].str.strip()
 
     # outlier flagging
     df["is_outlier"] = False
-    for field, (lo, hi) in BOUNDS.items():
-        mask = (df[field] < lo) | (df[field] > hi)
+    for measurement, (lo, hi) in BOUNDS.items():
+        mask = (df["measurement"] == measurement) & ((df["value"] < lo) | (df["value"] > hi))
         n_outliers = mask.sum()
         if n_outliers > 0:
-            log.info(f"  {field}: {n_outliers} outlier(s) flagged")
+            log.info(f"  {measurement}: {n_outliers} outlier(s) flagged")
         df.loc[mask, "is_outlier"] = True
 
-    return df
+    log.info(
+        f"  rows: {n_raw} raw → {n_after_ts} valid ts → {n_after_year} after year filter "
+        f"→ {n_after_filter} relevant measures → {n_after_sentinel} after sentinel removal"
+    )
 
+    # select final columns
+    return df[["timestamp", "site", "prediction", "prediction_date", "measurement", "value", "unit", "is_outlier"]]
 
 
 # ─── SQL UPSERT ───
 
 UPSERT_SQL = """
-INSERT INTO silver.weather_clean
-(timestamp, site, temperature_c, humidity_pct, precipitation_mm, radiation_wm2, is_outlier)
+INSERT INTO silver.weather_forecasts
+(timestamp, site, prediction, prediction_date, measurement, value, unit, is_outlier)
 VALUES
-(:timestamp, :site, :temperature_c, :humidity_pct, :precipitation_mm, :radiation_wm2, :is_outlier)
+(:timestamp, :site, :prediction, :prediction_date, :measurement, :value, :unit, :is_outlier)
 
-ON CONFLICT (timestamp, site)
+ON CONFLICT (timestamp, site, prediction, prediction_date, measurement)
 DO UPDATE SET
-temperature_c = EXCLUDED.temperature_c,
-humidity_pct = EXCLUDED.humidity_pct,
-precipitation_mm = EXCLUDED.precipitation_mm,
-radiation_wm2 = EXCLUDED.radiation_wm2,
+value = EXCLUDED.value,
+unit = EXCLUDED.unit,
 is_outlier = EXCLUDED.is_outlier
 """
 
 
 def upsert(engine, df):
-    """Upsert cleaned data into silver.weather_clean table."""
+    """Upsert cleaned data into silver.weather_forecasts table."""
     rows = df.to_dict(orient="records")
 
     with engine.begin() as conn:
@@ -225,7 +226,7 @@ def find_csv(watermark):
     all_files = list(root.rglob("*.csv"))
 
     new_files = [f for f in all_files if f.name not in watermark]
-    
+
     return new_files
 
 
@@ -253,13 +254,20 @@ def run():
     for i, path in enumerate(files, 1):
 
         log.info(f"[{i}/{len(files)}] Processing {path.name}")
+
+        # Extract prediction date from filename
+        prediction_date = parse_prediction_date(path.name)
+        if prediction_date is None:
+            log.warning(f"  Skipping {path.name}: could not parse prediction date from filename")
+            continue
+
         try:
             df = pd.read_csv(path)
             if df.empty:
                 log.warning(f"  Skipping {path.name}: file is empty")
                 mark_done(engine, path.name)
                 continue
-            df_clean = clean_dataframe(df)
+            df_clean = clean_dataframe(df, prediction_date)
             if df_clean.empty:
                 log.warning(f"  Skipping {path.name}: no rows after cleaning")
                 mark_done(engine, path.name)
@@ -269,7 +277,7 @@ def run():
             mark_done(engine, path.name)
         except Exception as e:
             log.error(f"  Failed to process {path.name}: {e}")
-        
+
 
 
     engine.dispose()
