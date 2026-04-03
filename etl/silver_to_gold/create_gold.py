@@ -192,11 +192,34 @@ CREATE TABLE IF NOT EXISTS gold.fact_device_health_day (
 
 CREATE INDEX IF NOT EXISTS idx_fhealth_apt ON gold.fact_device_health_day (apartment_key);
 
--- ── FACT: weather per day (blocked on Sacha) ────────────────────────────────
--- Uncomment when silver.weather_clean is ready.
+-- ── DIMENSION: weather site ──────────────────────────────────────────────────
 
--- CREATE TABLE IF NOT EXISTS gold.dim_weather_site ( ... );
--- CREATE TABLE IF NOT EXISTS gold.fact_weather_day ( ... );
+CREATE TABLE IF NOT EXISTS gold.dim_weather_site (
+    site_key        SERIAL PRIMARY KEY,
+    site_name       VARCHAR(100) NOT NULL,       -- matches silver.weather_forecasts.site
+    apartment_key   INTEGER REFERENCES gold.dim_apartment(apartment_key),
+    is_primary      BOOLEAN DEFAULT TRUE,        -- primary station for this apartment
+    UNIQUE (site_name, apartment_key)
+);
+
+-- ── FACT: weather per day ───────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS gold.fact_weather_day (
+    date_key             INTEGER NOT NULL REFERENCES gold.dim_date(date_key),
+    site_key             INTEGER NOT NULL REFERENCES gold.dim_weather_site(site_key),
+    prediction_date      DATE NOT NULL,           -- when the forecast was issued
+    temperature_c_avg    FLOAT,
+    temperature_c_min    FLOAT,
+    temperature_c_max    FLOAT,
+    humidity_pct_avg     FLOAT,
+    precipitation_mm_sum FLOAT,
+    radiation_wm2_avg    FLOAT,
+    n_model_runs         INTEGER,                 -- how many runs were averaged (data quality)
+    PRIMARY KEY (date_key, site_key, prediction_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fweather_date ON gold.fact_weather_day (date_key);
+CREATE INDEX IF NOT EXISTS idx_fweather_pdate ON gold.fact_weather_day (prediction_date);
 
 -- ── FACT: prediction (blocked on Johann ML sprint) ──────────────────────────
 -- Uncomment when ML sprint is done.
@@ -258,9 +281,10 @@ def run():
         with verify_engine.connect() as conn:
             tables = [
                 'dim_datetime', 'dim_date', 'dim_apartment', 'dim_room',
-                'dim_device', 'dim_tariff',
+                'dim_device', 'dim_tariff', 'dim_weather_site',
                 'fact_energy_minute', 'fact_environment_minute',
                 'fact_presence_minute', 'fact_device_health_day',
+                'fact_weather_day',
             ]
             for t in tables:
                 try:
