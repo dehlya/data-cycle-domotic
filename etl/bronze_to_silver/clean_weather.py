@@ -197,12 +197,22 @@ def clean_dataframe(df: pd.DataFrame, prediction_date) -> pd.DataFrame:
 # ─── BULK LOAD ───
 
 def upsert(engine, df):
-    """Bulk load into silver.weather_forecasts via temp table + INSERT ON CONFLICT."""
+    """Bulk load via COPY to temp table + INSERT ON CONFLICT. Fastest method."""
+    import io
 
-    with engine.begin() as conn:
-        # 1. Load into temp table (fast — no constraints, no indexes)
-        conn.execute(text("DROP TABLE IF EXISTS _tmp_weather"))
-        conn.execute(text("""
+    # 1. Write DataFrame to CSV buffer in memory
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, header=False, sep='\t')
+    buf.seek(0)
+
+    # 2. Get raw psycopg2 connection for COPY
+    raw = engine.raw_connection()
+    try:
+        cur = raw.cursor()
+
+        # 3. Create temp table (no constraints = fast writes)
+        cur.execute("DROP TABLE IF EXISTS _tmp_weather")
+        cur.execute("""
             CREATE TEMP TABLE _tmp_weather (
                 timestamp   TIMESTAMPTZ,
                 site        VARCHAR(100),
@@ -213,14 +223,13 @@ def upsert(engine, df):
                 unit        VARCHAR(20),
                 is_outlier  BOOLEAN
             )
-        """))
+        """)
 
-    # 2. Bulk copy via pandas (much faster than row-by-row INSERT)
-    df.to_sql("_tmp_weather", engine, if_exists="append", index=False, method="multi", chunksize=10000)
+        # 4. COPY from buffer — this is the fast part
+        cur.copy_from(buf, '_tmp_weather', sep='\t', null='')
 
-    # 3. Merge from temp into target (one SQL statement, server-side)
-    with engine.begin() as conn:
-        result = conn.execute(text("""
+        # 5. Merge into target
+        cur.execute("""
             INSERT INTO silver.weather_forecasts
                 (timestamp, site, prediction, prediction_date, measurement, value, unit, is_outlier)
             SELECT timestamp, site, prediction, prediction_date, measurement, value, unit, is_outlier
@@ -230,10 +239,18 @@ def upsert(engine, df):
                 value = EXCLUDED.value,
                 unit = EXCLUDED.unit,
                 is_outlier = EXCLUDED.is_outlier
-        """))
-        conn.execute(text("DROP TABLE IF EXISTS _tmp_weather"))
+        """)
+        n = cur.rowcount
 
-    return result.rowcount
+        cur.execute("DROP TABLE IF EXISTS _tmp_weather")
+        raw.commit()
+    except Exception:
+        raw.rollback()
+        raise
+    finally:
+        raw.close()
+
+    return n
 
 
 def find_csv(watermark):
