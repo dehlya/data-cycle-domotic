@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS silver.weather_clean (
     humidity_pct     FLOAT,
     precipitation_mm FLOAT,
     radiation_wm2    FLOAT,
+    is_outlier       BOOLEAN      DEFAULT FALSE,
     UNIQUE (timestamp, site)
 );
 CREATE INDEX IF NOT EXISTS idx_weather_clean_timestamp ON silver.weather_clean (timestamp);
