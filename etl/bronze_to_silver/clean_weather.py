@@ -194,28 +194,46 @@ def clean_dataframe(df: pd.DataFrame, prediction_date) -> pd.DataFrame:
     return df[["timestamp", "site", "prediction", "prediction_date", "measurement", "value", "unit", "is_outlier"]]
 
 
-# ─── SQL UPSERT ───
-
-UPSERT_SQL = """
-INSERT INTO silver.weather_forecasts
-(timestamp, site, prediction, prediction_date, measurement, value, unit, is_outlier)
-VALUES
-(:timestamp, :site, :prediction, :prediction_date, :measurement, :value, :unit, :is_outlier)
-
-ON CONFLICT (timestamp, site, prediction, prediction_date, measurement)
-DO UPDATE SET
-value = EXCLUDED.value,
-unit = EXCLUDED.unit,
-is_outlier = EXCLUDED.is_outlier
-"""
-
+# ─── BULK LOAD ───
 
 def upsert(engine, df):
-    """Upsert cleaned data into silver.weather_forecasts table."""
-    rows = df.to_dict(orient="records")
+    """Bulk load into silver.weather_forecasts via temp table + INSERT ON CONFLICT."""
 
     with engine.begin() as conn:
-        conn.execute(text(UPSERT_SQL), rows)
+        # 1. Load into temp table (fast — no constraints, no indexes)
+        conn.execute(text("DROP TABLE IF EXISTS _tmp_weather"))
+        conn.execute(text("""
+            CREATE TEMP TABLE _tmp_weather (
+                timestamp   TIMESTAMPTZ,
+                site        VARCHAR(100),
+                prediction  SMALLINT,
+                prediction_date DATE,
+                measurement VARCHAR(50),
+                value       FLOAT,
+                unit        VARCHAR(20),
+                is_outlier  BOOLEAN
+            )
+        """))
+
+    # 2. Bulk copy via pandas (much faster than row-by-row INSERT)
+    df.to_sql("_tmp_weather", engine, if_exists="append", index=False, method="multi", chunksize=10000)
+
+    # 3. Merge from temp into target (one SQL statement, server-side)
+    with engine.begin() as conn:
+        result = conn.execute(text("""
+            INSERT INTO silver.weather_forecasts
+                (timestamp, site, prediction, prediction_date, measurement, value, unit, is_outlier)
+            SELECT timestamp, site, prediction, prediction_date, measurement, value, unit, is_outlier
+            FROM _tmp_weather
+            ON CONFLICT (timestamp, site, prediction, prediction_date, measurement)
+            DO UPDATE SET
+                value = EXCLUDED.value,
+                unit = EXCLUDED.unit,
+                is_outlier = EXCLUDED.is_outlier
+        """))
+        conn.execute(text("DROP TABLE IF EXISTS _tmp_weather"))
+
+    return result.rowcount
 
 
 def find_csv(watermark):
@@ -251,8 +269,12 @@ def run():
 
     total_rows = 0
 
+    import time
+    t_start = time.monotonic()
+
     for i, path in enumerate(files, 1):
 
+        t_file = time.monotonic()
         log.info(f"[{i}/{len(files)}] Processing {path.name}")
 
         # Extract prediction date from filename
@@ -272,8 +294,13 @@ def run():
                 log.warning(f"  Skipping {path.name}: no rows after cleaning")
                 mark_done(engine, path.name)
                 continue
-            upsert(engine, df_clean)
-            total_rows += len(df_clean)
+            n = upsert(engine, df_clean)
+            total_rows += n
+            elapsed_file = time.monotonic() - t_file
+            elapsed_total = time.monotonic() - t_start
+            avg_per_file = elapsed_total / i
+            eta = avg_per_file * (len(files) - i)
+            log.info(f"  {n} rows upserted in {elapsed_file:.1f}s — avg {avg_per_file:.1f}s/file — ETA {eta/60:.0f}min")
             mark_done(engine, path.name)
         except Exception as e:
             log.error(f"  Failed to process {path.name}: {e}")
