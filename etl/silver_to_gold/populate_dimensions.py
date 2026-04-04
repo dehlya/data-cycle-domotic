@@ -18,7 +18,7 @@ def populate(engine, log, YE, R):
     """Populate all shared dimension tables."""
 
     # ═══════════════════════════════════════════════════════════════════════
-    # dim_date
+    # dim_date — from both sensor_events AND weather_forecasts
     # ═══════════════════════════════════════════════════════════════════════
     print(f"  {YE}>{R} dim_date...")
     with engine.begin() as conn:
@@ -26,20 +26,24 @@ def populate(engine, log, YE, R):
             INSERT INTO gold.dim_date
                 (date_key, date, day_of_week, week, month, year, is_weekend)
             SELECT DISTINCT
-                TO_CHAR(timestamp::date, 'YYYYMMDD')::INTEGER AS date_key,
-                timestamp::date AS date,
-                TO_CHAR(timestamp::date, 'FMDay') AS day_of_week,
-                EXTRACT(WEEK  FROM timestamp)::SMALLINT AS week,
-                EXTRACT(MONTH FROM timestamp)::SMALLINT AS month,
-                EXTRACT(YEAR  FROM timestamp)::SMALLINT AS year,
-                EXTRACT(ISODOW FROM timestamp) IN (6, 7) AS is_weekend
-            FROM silver.sensor_events
+                TO_CHAR(d::date, 'YYYYMMDD')::INTEGER AS date_key,
+                d::date AS date,
+                TO_CHAR(d::date, 'FMDay') AS day_of_week,
+                EXTRACT(WEEK  FROM d)::SMALLINT AS week,
+                EXTRACT(MONTH FROM d)::SMALLINT AS month,
+                EXTRACT(YEAR  FROM d)::SMALLINT AS year,
+                EXTRACT(ISODOW FROM d) IN (6, 7) AS is_weekend
+            FROM (
+                SELECT timestamp AS d FROM silver.sensor_events
+                UNION
+                SELECT timestamp AS d FROM silver.weather_forecasts
+            ) all_dates
             ON CONFLICT (date) DO NOTHING
         """))
         log.info(f"dim_date: {result.rowcount} rows inserted")
 
     # ═══════════════════════════════════════════════════════════════════════
-    # dim_datetime
+    # dim_datetime — from both sensor_events AND weather_forecasts
     # ═══════════════════════════════════════════════════════════════════════
     print(f"  {YE}>{R} dim_datetime...")
     with engine.begin() as conn:
@@ -48,17 +52,21 @@ def populate(engine, log, YE, R):
                 (datetime_key, timestamp_utc, date_key, hour, minute,
                  day_of_week, week, month, year, is_weekend)
             SELECT DISTINCT
-                TO_CHAR(date_trunc('minute', timestamp), 'YYYYMMDDHH24MI')::BIGINT AS datetime_key,
-                date_trunc('minute', timestamp) AS timestamp_utc,
-                TO_CHAR(timestamp::date, 'YYYYMMDD')::INTEGER AS date_key,
-                EXTRACT(HOUR   FROM timestamp)::SMALLINT AS hour,
-                EXTRACT(MINUTE FROM timestamp)::SMALLINT AS minute,
-                TO_CHAR(timestamp::date, 'FMDay') AS day_of_week,
-                EXTRACT(WEEK  FROM timestamp)::SMALLINT AS week,
-                EXTRACT(MONTH FROM timestamp)::SMALLINT AS month,
-                EXTRACT(YEAR  FROM timestamp)::SMALLINT AS year,
-                EXTRACT(ISODOW FROM timestamp) IN (6, 7) AS is_weekend
-            FROM silver.sensor_events
+                TO_CHAR(date_trunc('minute', d), 'YYYYMMDDHH24MI')::BIGINT AS datetime_key,
+                date_trunc('minute', d) AS timestamp_utc,
+                TO_CHAR(d::date, 'YYYYMMDD')::INTEGER AS date_key,
+                EXTRACT(HOUR   FROM d)::SMALLINT AS hour,
+                EXTRACT(MINUTE FROM d)::SMALLINT AS minute,
+                TO_CHAR(d::date, 'FMDay') AS day_of_week,
+                EXTRACT(WEEK  FROM d)::SMALLINT AS week,
+                EXTRACT(MONTH FROM d)::SMALLINT AS month,
+                EXTRACT(YEAR  FROM d)::SMALLINT AS year,
+                EXTRACT(ISODOW FROM d) IN (6, 7) AS is_weekend
+            FROM (
+                SELECT timestamp AS d FROM silver.sensor_events
+                UNION
+                SELECT timestamp AS d FROM silver.weather_forecasts
+            ) all_timestamps
             ON CONFLICT (timestamp_utc) DO NOTHING
         """))
         log.info(f"dim_datetime: {result.rowcount} rows inserted")
@@ -82,7 +90,7 @@ def populate(engine, log, YE, R):
             conn.execute(text("""
                 UPDATE gold.dim_apartment a
                 SET building_name = b."houseName",
-                    building_id   = b."id"::INTEGER
+                    building_id   = b."idBuilding"::INTEGER
                 FROM silver.dim_buildings b
                 WHERE (a.apartment_id = 'jimmy'   AND LOWER(b."houseName") LIKE '%jimmy%')
                    OR (a.apartment_id = 'jeremie' AND LOWER(b."houseName") LIKE '%jeremie%')
