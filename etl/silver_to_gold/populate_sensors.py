@@ -187,5 +187,8 @@ def populate(engine, log, YE, R, GR):
     print(f"\n  {YE}>{R} mv_energy_with_cost (refresh)...")
     t1 = time.monotonic()
     with engine.begin() as conn:
-        conn.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY gold.mv_energy_with_cost"))
+        try:
+            conn.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY gold.mv_energy_with_cost"))
+        except Exception:
+            conn.execute(text("REFRESH MATERIALIZED VIEW gold.mv_energy_with_cost"))
         log.info(f"mv_energy_with_cost refreshed ({time.monotonic()-t1:.1f}s)")
