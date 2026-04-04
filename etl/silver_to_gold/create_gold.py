@@ -214,12 +214,13 @@ CREATE TABLE IF NOT EXISTS gold.fact_weather_hour (
     datetime_key         BIGINT NOT NULL REFERENCES gold.dim_datetime(datetime_key),
     date_key             INTEGER NOT NULL REFERENCES gold.dim_date(date_key),
     site_key             INTEGER NOT NULL REFERENCES gold.dim_weather_site(site_key),
+    prediction_date      DATE NOT NULL,           -- when the forecast file was issued
     temperature_c        FLOAT,
     humidity_pct         FLOAT,
     precipitation_mm     FLOAT,
     radiation_wm2        FLOAT,
     n_model_runs         INTEGER,                 -- how many runs were averaged (data quality)
-    PRIMARY KEY (datetime_key, site_key)
+    PRIMARY KEY (datetime_key, site_key, prediction_date)
 );
 
 CREATE INDEX IF NOT EXISTS idx_fweather_date ON gold.fact_weather_hour (date_key);

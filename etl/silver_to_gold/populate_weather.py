@@ -55,14 +55,15 @@ def populate(engine, log, weather_sites, YE, R):
     with engine.begin() as conn:
         result = conn.execute(text("""
             INSERT INTO gold.fact_weather_hour
-                (datetime_key, date_key, site_key,
+                (datetime_key, date_key, site_key, prediction_date,
                  temperature_c, humidity_pct, precipitation_mm, radiation_wm2,
                  n_model_runs)
             SELECT
                 TO_CHAR(date_trunc('minute', wf.timestamp), 'YYYYMMDDHH24MI')::BIGINT AS datetime_key,
                 TO_CHAR(wf.timestamp::date, 'YYYYMMDD')::INTEGER AS date_key,
                 ws.site_key,
-                -- Average across all model runs for this hour
+                wf.prediction_date,
+                -- Average across all model runs for this hour + prediction_date
                 AVG(CASE WHEN wf.measurement = 'PRED_T_2M_ctrl' THEN wf.value END) AS temperature_c,
                 AVG(CASE WHEN wf.measurement = 'PRED_RELHUM_2M_ctrl' THEN wf.value END) AS humidity_pct,
                 AVG(CASE WHEN wf.measurement = 'PRED_TOT_PREC_ctrl' THEN wf.value END) AS precipitation_mm,
@@ -72,8 +73,8 @@ def populate(engine, log, weather_sites, YE, R):
             FROM silver.weather_forecasts wf
             JOIN gold.dim_weather_site ws ON ws.site_name = wf.site
             WHERE NOT wf.is_outlier
-            GROUP BY date_trunc('minute', wf.timestamp), wf.timestamp::date, ws.site_key
-            ON CONFLICT (datetime_key, site_key) DO UPDATE SET
+            GROUP BY date_trunc('minute', wf.timestamp), wf.timestamp::date, ws.site_key, wf.prediction_date
+            ON CONFLICT (datetime_key, site_key, prediction_date) DO UPDATE SET
                 temperature_c    = EXCLUDED.temperature_c,
                 humidity_pct     = EXCLUDED.humidity_pct,
                 precipitation_mm = EXCLUDED.precipitation_mm,
