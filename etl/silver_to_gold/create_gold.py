@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS gold.dim_apartment (
     building_id     INTEGER,
     building_name   VARCHAR(100),
     floor           INTEGER,
+    weather_site_key INTEGER,                    -- FK added after dim_weather_site exists
     UNIQUE (apartment_id)
 );
 
@@ -196,30 +197,32 @@ CREATE INDEX IF NOT EXISTS idx_fhealth_apt ON gold.fact_device_health_day (apart
 
 CREATE TABLE IF NOT EXISTS gold.dim_weather_site (
     site_key        SERIAL PRIMARY KEY,
-    site_name       VARCHAR(100) NOT NULL,       -- matches silver.weather_forecasts.site
-    apartment_key   INTEGER REFERENCES gold.dim_apartment(apartment_key),
-    is_primary      BOOLEAN DEFAULT TRUE,        -- primary station for this apartment
-    UNIQUE (site_name, apartment_key)
+    site_name       VARCHAR(100) NOT NULL UNIQUE  -- matches silver.weather_forecasts.site
 );
 
--- ── FACT: weather per day ───────────────────────────────────────────────────
+-- FK: apartment -> weather site (added after both tables exist)
+DO $$ BEGIN
+    ALTER TABLE gold.dim_apartment
+        ADD CONSTRAINT fk_apartment_weather_site
+        FOREIGN KEY (weather_site_key) REFERENCES gold.dim_weather_site(site_key);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
-CREATE TABLE IF NOT EXISTS gold.fact_weather_day (
+-- ── FACT: weather per hour ─────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS gold.fact_weather_hour (
+    datetime_key         BIGINT NOT NULL REFERENCES gold.dim_datetime(datetime_key),
     date_key             INTEGER NOT NULL REFERENCES gold.dim_date(date_key),
     site_key             INTEGER NOT NULL REFERENCES gold.dim_weather_site(site_key),
-    prediction_date      DATE NOT NULL,           -- when the forecast was issued
-    temperature_c_avg    FLOAT,
-    temperature_c_min    FLOAT,
-    temperature_c_max    FLOAT,
-    humidity_pct_avg     FLOAT,
-    precipitation_mm_sum FLOAT,
-    radiation_wm2_avg    FLOAT,
+    temperature_c        FLOAT,
+    humidity_pct         FLOAT,
+    precipitation_mm     FLOAT,
+    radiation_wm2        FLOAT,
     n_model_runs         INTEGER,                 -- how many runs were averaged (data quality)
-    PRIMARY KEY (date_key, site_key, prediction_date)
+    PRIMARY KEY (datetime_key, site_key)
 );
 
-CREATE INDEX IF NOT EXISTS idx_fweather_date ON gold.fact_weather_day (date_key);
-CREATE INDEX IF NOT EXISTS idx_fweather_pdate ON gold.fact_weather_day (prediction_date);
+CREATE INDEX IF NOT EXISTS idx_fweather_date ON gold.fact_weather_hour (date_key);
 
 -- ── FACT: prediction (blocked on Johann ML sprint) ──────────────────────────
 -- Uncomment when ML sprint is done.
@@ -284,7 +287,7 @@ def run():
                 'dim_device', 'dim_tariff', 'dim_weather_site',
                 'fact_energy_minute', 'fact_environment_minute',
                 'fact_presence_minute', 'fact_device_health_day',
-                'fact_weather_day',
+                'fact_weather_hour',
             ]
             for t in tables:
                 try:

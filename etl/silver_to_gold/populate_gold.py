@@ -101,7 +101,7 @@ def run():
             'dim_device', 'dim_tariff', 'dim_weather_site',
             'fact_energy_minute', 'fact_environment_minute',
             'fact_presence_minute', 'fact_device_health_day',
-            'fact_weather_day', 'mv_energy_with_cost',
+            'fact_weather_hour', 'mv_energy_with_cost',
         ]
         for table in tables:
             try:
