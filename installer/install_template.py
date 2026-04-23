@@ -8,13 +8,14 @@ Usage:
     python data-cycle-installer.py /custom/path
 
 What this does:
-    1. Checks prerequisites (Python 3.11+, git, PostgreSQL reachable)
+    1. Checks prerequisites (Python 3.11+, git)
     2. Clones the repo
-    3. Creates a Python venv and installs requirements
-    4. Writes the .env file from the embedded config
-    5. Creates PostgreSQL schemas (silver + gold)
+    3. Writes .env, creates venv, installs requirements
+    4. Pre-flight: validates DB, MySQL, sFTP credentials
+    5. Creates PostgreSQL database if missing + silver/gold schemas
     6. Runs the initial ETL (bronze -> silver -> gold)
-    7. Prints next steps
+    7. Verifies data landed (row counts)
+    8. Offers to start the watcher
 
 Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
@@ -24,7 +25,16 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from datetime import datetime
 from pathlib import Path
+
+# Force UTF-8 on Windows consoles so our box characters / ✓ / ✗ render
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # =============================================================================
 # CONFIG (replaced by the web wizard at download time)
@@ -76,6 +86,29 @@ RED   = "\033[31m"
 YELLOW= "\033[33m"
 BLUE  = "\033[36m"
 
+# Disable ANSI if output is being piped / redirected
+if not sys.stdout.isatty():
+    RESET = BOLD = DIM = GREEN = RED = YELLOW = BLUE = ""
+
+
+class Summary:
+    """Tracks what succeeded / failed for the final recap."""
+    def __init__(self):
+        self.ok = []
+        self.skipped = []
+        self.failed = []
+
+    def add_ok(self, msg): self.ok.append(msg)
+    def add_skipped(self, msg, reason): self.skipped.append((msg, reason))
+    def add_failed(self, msg, reason): self.failed.append((msg, reason))
+
+SUMMARY = Summary()
+LOG_LINES = []
+
+
+def log(msg):
+    LOG_LINES.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
 
 def banner():
     print()
@@ -88,26 +121,51 @@ def banner():
 
 def step(num, total, message):
     print(f"\n{BOLD}[{num}/{total}] {message}{RESET}")
+    log(f"STEP {num}/{total}: {message}")
 
 
 def ok(msg):
     print(f"  {GREEN}✓{RESET} {msg}")
+    log(f"  OK: {msg}")
 
 
 def warn(msg):
     print(f"  {YELLOW}⚠{RESET} {msg}")
+    log(f"  WARN: {msg}")
 
 
 def fail(msg, hint=None):
     print(f"  {RED}✗ {msg}{RESET}")
+    log(f"  FAIL: {msg}")
     if hint:
         print(f"    {DIM}{hint}{RESET}")
+        log(f"    hint: {hint}")
 
 
 def die(msg, hint=None):
     fail(msg, hint)
-    print(f"\n{RED}{BOLD}Installation aborted.{RESET}\n")
+    write_log()
+    print(f"\n{RED}{BOLD}Installation aborted.{RESET}")
+    print(f"{DIM}Log saved to install.log{RESET}\n")
     sys.exit(1)
+
+
+def write_log():
+    try:
+        Path("install.log").write_text("\n".join(LOG_LINES) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def ask_yes_no(prompt: str, default: bool = False) -> bool:
+    suffix = " [Y/n]" if default else " [y/N]"
+    try:
+        ans = input(f"{BOLD}{prompt}{suffix}:{RESET} ").strip().lower()
+    except EOFError:
+        return default
+    if not ans:
+        return default
+    return ans in ("y", "yes", "o", "oui")
 
 
 # =============================================================================
@@ -141,49 +199,125 @@ def parse_db_url(db_url: str):
     )
 
 
-def ensure_database_exists(venv: Path, db_url: str):
-    """Check the target DB exists; if not, create it via the postgres maintenance DB."""
-    host, port, user, password, dbname = parse_db_url(db_url)
+def run_python_snippet(venv: Path, snippet: str) -> tuple[int, str, str]:
+    """Run a one-line python snippet in the venv, return (code, stdout, stderr)."""
     py = venv_python(venv)
-    snippet = f"""
-import sys
-try:
-    import psycopg2
-except ImportError:
-    sys.exit("psycopg2 not installed")
-
-# Try to connect directly to target DB
-try:
-    c = psycopg2.connect(host="{host}", port={port}, user="{user}", password="{password}", dbname="{dbname}")
-    c.close()
-    print("EXISTS")
-    sys.exit(0)
-except psycopg2.OperationalError as e:
-    if "does not exist" not in str(e).lower():
-        sys.exit(f"FAIL:{{e}}")
-
-# Create it from the postgres maintenance DB
-try:
-    c = psycopg2.connect(host="{host}", port={port}, user="{user}", password="{password}", dbname="postgres")
-    c.autocommit = True
-    cur = c.cursor()
-    cur.execute('CREATE DATABASE "{dbname}"')
-    cur.close(); c.close()
-    print("CREATED")
-except Exception as e:
-    sys.exit(f"FAIL:{{e}}")
-"""
     res = subprocess.run([str(py), "-c", snippet], capture_output=True, text=True)
-    if res.returncode != 0:
-        warn(f"DB check/create: {res.stdout.strip()}{res.stderr.strip()}")
-        warn(f"You may need to create '{dbname}' manually, or check credentials.")
+    return res.returncode, res.stdout.strip(), res.stderr.strip()
+
+
+def validate_postgres(venv: Path, db_url: str) -> bool:
+    """Confirm we can reach Postgres (DB may not exist yet — that's fine)."""
+    host, port, user, password, dbname = parse_db_url(db_url)
+    snippet = (
+        "import sys\n"
+        "try:\n"
+        "    import psycopg2\n"
+        "except ImportError:\n"
+        "    sys.exit('NO_DRIVER')\n"
+        "try:\n"
+        f"    c = psycopg2.connect(host='{host}', port={port}, user='{user}', password='{password}', dbname='postgres', connect_timeout=5)\n"
+        "    c.close()\n"
+        "    print('OK')\n"
+        "except Exception as e:\n"
+        "    sys.exit('CONN_FAIL:' + str(e))\n"
+    )
+    rc, out, err = run_python_snippet(venv, snippet)
+    if rc == 0:
+        ok(f"PostgreSQL reachable at {host}:{port}")
+        return True
+    fail(f"PostgreSQL unreachable at {host}:{port}", hint=err.strip().splitlines()[0] if err else "")
+    return False
+
+
+def ensure_database_exists(venv: Path, db_url: str) -> bool:
+    """Create the target database if it doesn't exist."""
+    host, port, user, password, dbname = parse_db_url(db_url)
+    snippet = (
+        "import sys\n"
+        "import psycopg2\n"
+        "try:\n"
+        f"    c = psycopg2.connect(host='{host}', port={port}, user='{user}', password='{password}', dbname='{dbname}', connect_timeout=5)\n"
+        "    c.close()\n"
+        "    print('EXISTS')\n"
+        "    sys.exit(0)\n"
+        "except psycopg2.OperationalError as e:\n"
+        "    if 'does not exist' not in str(e).lower():\n"
+        "        sys.exit('FAIL:' + str(e))\n"
+        "try:\n"
+        f"    c = psycopg2.connect(host='{host}', port={port}, user='{user}', password='{password}', dbname='postgres', connect_timeout=5)\n"
+        "    c.autocommit = True\n"
+        "    cur = c.cursor()\n"
+        f"    cur.execute('CREATE DATABASE \"{dbname}\"')\n"
+        "    cur.close(); c.close()\n"
+        "    print('CREATED')\n"
+        "except Exception as e:\n"
+        "    sys.exit('FAIL:' + str(e))\n"
+    )
+    rc, out, err = run_python_snippet(venv, snippet)
+    if rc != 0:
+        fail(f"Could not create DB '{dbname}'", err or "")
         return False
-    out = res.stdout.strip()
     if out == "EXISTS":
         ok(f"Database '{dbname}' already exists")
-    elif out == "CREATED":
+    else:
         ok(f"Database '{dbname}' created")
     return True
+
+
+def validate_mysql(venv: Path, mysql_url: str) -> bool:
+    snippet = (
+        "import sys\n"
+        "try:\n"
+        "    import pymysql\n"
+        "except ImportError:\n"
+        "    sys.exit('NO_DRIVER')\n"
+        "from urllib.parse import urlparse, unquote\n"
+        f"u = urlparse('{mysql_url}')\n"
+        "try:\n"
+        "    c = pymysql.connect(host=u.hostname, port=u.port or 3306, user=unquote(u.username or ''), password=unquote(u.password or ''), database=(u.path or '/').lstrip('/'), connect_timeout=5)\n"
+        "    c.close()\n"
+        "    print('OK')\n"
+        "except Exception as e:\n"
+        "    sys.exit('FAIL:' + str(e)[:200])\n"
+    )
+    rc, out, err = run_python_snippet(venv, snippet)
+    if rc == 0:
+        ok("MySQL source reachable")
+        return True
+    warn(f"MySQL source unreachable -- sensor DB syncing will fail")
+    if err:
+        warn(f"  details: {err.splitlines()[0]}")
+    return False
+
+
+def validate_sftp(venv: Path, host: str, port: str, user: str, password: str) -> bool:
+    if not (host and user and password):
+        SUMMARY.add_skipped("sFTP check", "credentials not provided")
+        return True  # sFTP is optional
+    snippet = (
+        "import sys\n"
+        "try:\n"
+        "    import paramiko\n"
+        "except ImportError:\n"
+        "    sys.exit('NO_DRIVER')\n"
+        "try:\n"
+        f"    t = paramiko.Transport(('{host}', {port or 22}))\n"
+        "    t.banner_timeout = 10\n"
+        f"    t.connect(username='{user}', password='{password}')\n"
+        "    t.close()\n"
+        "    print('OK')\n"
+        "except Exception as e:\n"
+        "    sys.exit('FAIL:' + str(e)[:200])\n"
+    )
+    rc, out, err = run_python_snippet(venv, snippet)
+    if rc == 0:
+        ok(f"sFTP reachable at {host}:{port or 22}")
+        return True
+    warn(f"sFTP unreachable at {host}:{port or 22}")
+    if err:
+        warn(f"  details: {err.splitlines()[0]}")
+    return False
 
 
 def clone_repo(install_dir: Path):
@@ -225,8 +359,8 @@ def install_deps(venv: Path, install_dir: Path):
     req = install_dir / "requirements.txt"
     if not req.exists():
         die(f"requirements.txt not found at {req}")
-    subprocess.run([str(py), "-m", "pip", "install", "--upgrade", "pip"], check=True)
-    subprocess.run([str(py), "-m", "pip", "install", "-r", str(req)], check=True)
+    subprocess.run([str(py), "-m", "pip", "install", "--upgrade", "pip", "--quiet"], check=True)
+    subprocess.run([str(py), "-m", "pip", "install", "-r", str(req), "--quiet"], check=True)
     ok("Python dependencies installed")
 
 
@@ -252,6 +386,53 @@ def run_initial_etl(venv: Path, install_dir: Path):
     run_script(venv, install_dir, "-m", "etl.silver_to_gold.populate_gold", label="Initial gold ETL complete")
 
 
+def verify_data(venv: Path, db_url: str):
+    """Quick sanity check: count rows in key gold tables."""
+    host, port, user, password, dbname = parse_db_url(db_url)
+    snippet = (
+        "import psycopg2, sys\n"
+        f"c = psycopg2.connect(host='{host}', port={port}, user='{user}', password='{password}', dbname='{dbname}', connect_timeout=5)\n"
+        "cur = c.cursor()\n"
+        "for t in ['dim_apartment','dim_room','dim_device','fact_environment_minute','fact_energy_minute','fact_presence_minute']:\n"
+        "    try:\n"
+        "        cur.execute(f'SELECT COUNT(*) FROM gold.{t}')\n"
+        "        print(f'{t}\\t{cur.fetchone()[0]}')\n"
+        "    except Exception as e:\n"
+        "        print(f'{t}\\tERR: ' + str(e)[:60])\n"
+        "cur.close(); c.close()\n"
+    )
+    rc, out, err = run_python_snippet(venv, snippet)
+    if rc != 0:
+        warn(f"Verification query failed: {err or out}")
+        return
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2:
+            t, n = parts
+            if n.startswith("ERR"):
+                fail(f"  gold.{t} — {n}")
+            elif int(n) == 0:
+                warn(f"  gold.{t} — empty")
+            else:
+                ok(f"  gold.{t} — {int(n):,} rows")
+
+
+def maybe_start_watcher(venv: Path, install_dir: Path):
+    if not sys.stdin.isatty():
+        return
+    if not ask_yes_no("Start the watcher now? (runs continuously in this terminal)", default=False):
+        return
+    print()
+    print(f"{DIM}Starting watcher... Ctrl+C to stop.{RESET}")
+    py = venv_python(venv)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(install_dir)
+    try:
+        subprocess.run([str(py), "ingestion/fast_flow/watcher.py"], cwd=str(install_dir), env=env)
+    except KeyboardInterrupt:
+        print(f"\n{DIM}Watcher stopped.{RESET}")
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -259,70 +440,102 @@ def run_initial_etl(venv: Path, install_dir: Path):
 def main():
     banner()
 
-    # Where to install
     install_path = Path(sys.argv[1]).expanduser().resolve() if len(sys.argv) > 1 \
                    else Path.cwd() / DEFAULT_INSTALL_DIR
 
     print(f"Install target: {BOLD}{install_path}{RESET}")
 
-    # ── 1. Prerequisites ─────────────────────────────────────────────────────
-    step(1, 7, "Checking prerequisites")
+    # ── 1. Prerequisites ────────────────────────────────────────────────────
+    step(1, 8, "Checking prerequisites")
     check_python()
     check_cmd("git", "Install Git from https://git-scm.com/downloads")
 
-    # ── 2. Clone repo ────────────────────────────────────────────────────────
-    step(2, 7, "Cloning repository")
+    # ── 2. Clone repo ──────────────────────────────────────────────────────
+    step(2, 8, "Cloning repository")
     clone_repo(install_path)
 
-    # ── 3. Write .env ────────────────────────────────────────────────────────
-    step(3, 7, "Writing .env configuration")
+    # ── 3. Write .env ──────────────────────────────────────────────────────
+    step(3, 8, "Writing .env configuration")
     write_env(install_path)
 
-    # ── 4. Create venv ───────────────────────────────────────────────────────
-    step(4, 7, "Creating Python virtual environment")
+    # ── 4. Create venv + deps ──────────────────────────────────────────────
+    step(4, 8, "Setting up Python environment")
     venv = create_venv(install_path)
-
-    # ── 5. Install deps ──────────────────────────────────────────────────────
-    step(5, 7, "Installing Python dependencies")
     install_deps(venv, install_path)
 
-    # ── 6. Create DB + schemas ───────────────────────────────────────────────
-    step(6, 7, "Ensuring PostgreSQL database and schemas")
+    # ── 5. Pre-flight connectivity checks ─────────────────────────────────
+    step(5, 8, "Pre-flight connectivity checks")
     import re
-    m = re.search(r"DB_URL=(.+)", ENV_CONFIG)
-    if m:
-        ensure_database_exists(venv, m.group(1).strip())
+    db_m      = re.search(r"DB_URL=(.+)",       ENV_CONFIG)
+    mysql_m   = re.search(r"MYSQL_URL=(.+)",    ENV_CONFIG)
+    sftp_h    = re.search(r"SFTP_HOST=(.*)",    ENV_CONFIG)
+    sftp_p    = re.search(r"SFTP_PORT=(.*)",    ENV_CONFIG)
+    sftp_u    = re.search(r"SFTP_USER=(.*)",    ENV_CONFIG)
+    sftp_pw   = re.search(r"SFTP_PASSWORD=(.*)",ENV_CONFIG)
+
+    db_url = db_m.group(1).strip() if db_m else ""
+    if db_url and not validate_postgres(venv, db_url):
+        die("Fix your DB credentials (or start PostgreSQL) and rerun.")
+
+    if mysql_m:
+        validate_mysql(venv, mysql_m.group(1).strip())  # warn only, don't die
+    if sftp_h:
+        validate_sftp(venv,
+                      sftp_h.group(1).strip(),
+                      sftp_p.group(1).strip() if sftp_p else "22",
+                      sftp_u.group(1).strip() if sftp_u else "",
+                      sftp_pw.group(1).strip() if sftp_pw else "")
+
+    # ── 6. Ensure DB + schemas ─────────────────────────────────────────────
+    step(6, 8, "Creating PostgreSQL database + schemas")
+    if db_url:
+        ensure_database_exists(venv, db_url)
     try:
         create_schemas(venv, install_path)
     except Exception as e:
         warn(f"Schema creation had issues: {e}")
-        warn("You may need to check DB_URL and rerun manually.")
 
-    # ── 7. Initial ETL (optional — can take time) ────────────────────────────
-    step(7, 7, "Running initial ETL (may take several minutes)")
+    # ── 7. Initial ETL ─────────────────────────────────────────────────────
+    step(7, 8, "Running initial ETL (this may take a few minutes)")
     try:
         run_initial_etl(venv, install_path)
     except Exception as e:
         warn(f"Initial ETL had issues: {e}")
         warn("You can re-run manually: python -m etl.silver_to_gold.populate_gold")
 
-    # ── Done ─────────────────────────────────────────────────────────────────
+    # ── 8. Verify ──────────────────────────────────────────────────────────
+    step(8, 8, "Verifying gold data")
+    if db_url:
+        verify_data(venv, db_url)
+
+    # ── Done ───────────────────────────────────────────────────────────────
     print()
     print(f"{GREEN}{BOLD}╔══════════════════════════════════════════════════════════════╗{RESET}")
     print(f"{GREEN}{BOLD}║                     Installation complete!                   ║{RESET}")
     print(f"{GREEN}{BOLD}╚══════════════════════════════════════════════════════════════╝{RESET}")
     print()
-    py_rel = venv_python(venv).relative_to(install_path) if venv_python(venv).is_relative_to(install_path) else venv_python(venv)
+
+    py_rel = venv_python(venv)
     print(f"{BOLD}Next steps:{RESET}")
-    print(f"  {DIM}1.{RESET} Start the watcher (continuous pipeline):")
-    print(f"     cd {install_path}")
-    print(f"     {py_rel} ingestion/fast_flow/watcher.py")
-    print()
-    print(f"  {DIM}2.{RESET} Open the Power BI dashboard:")
+    print(f"  {DIM}1.{RESET} Open the Power BI dashboard:")
     print(f"     {install_path / 'bi' / 'power_bi' / 'DataCycleDomotic.pbix'}")
     print()
-    print(f"  {DIM}3.{RESET} In Power BI: Home -> Refresh  (loads latest gold data)")
+    print(f"  {DIM}2.{RESET} Start the continuous pipeline (watcher):")
+    print(f"     cd {install_path}")
+    if os.name == "nt":
+        print(f"     .venv\\Scripts\\python.exe ingestion\\fast_flow\\watcher.py")
+    else:
+        print(f"     .venv/bin/python ingestion/fast_flow/watcher.py")
     print()
+    print(f"  {DIM}3.{RESET} In Power BI: Home -> Refresh (loads latest gold data)")
+    print()
+
+    write_log()
+    print(f"{DIM}Install log saved to install.log{RESET}")
+    print()
+
+    # Offer to start the watcher right now
+    maybe_start_watcher(venv, install_path)
 
 
 if __name__ == "__main__":
@@ -330,11 +543,14 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print(f"\n{YELLOW}Interrupted by user.{RESET}")
+        write_log()
         sys.exit(130)
     except subprocess.CalledProcessError as e:
         print(f"\n{RED}{BOLD}A subprocess failed (exit {e.returncode}).{RESET}")
-        print(f"{DIM}Command: {' '.join(str(x) for x in e.cmd)}{RESET}\n")
+        print(f"{DIM}Command: {' '.join(str(x) for x in e.cmd)}{RESET}")
+        write_log()
         sys.exit(1)
     except Exception as e:
         print(f"\n{RED}{BOLD}Unexpected error:{RESET} {e}")
+        write_log()
         sys.exit(1)
