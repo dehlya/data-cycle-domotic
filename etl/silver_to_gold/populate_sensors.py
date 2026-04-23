@@ -105,10 +105,7 @@ def populate(engine, log, YE, R, GR):
                 SUM(CASE WHEN se.sensor_type = 'motion' AND se.field = 'motion'
                           AND se.value = 1.0 THEN 1 ELSE 0 END)::INTEGER,
                 BOOL_OR(CASE WHEN se.sensor_type = 'door' AND se.field = 'open' THEN se.value = 1.0 END),
-                BOOL_OR(
-                    (se.sensor_type = 'motion' AND se.field = 'motion' AND se.value = 1.0) OR
-                    (se.sensor_type = 'door' AND se.field = 'open' AND se.value = 1.0)
-                ),
+                BOOL_OR(se.sensor_type = 'motion' AND se.field = 'motion' AND se.value = 1.0),
                 NULL::FLOAT
             FROM silver.sensor_events se
             JOIN gold.dim_apartment a ON a.apartment_id = se.apartment

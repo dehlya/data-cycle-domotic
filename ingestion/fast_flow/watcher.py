@@ -15,7 +15,7 @@ Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 
 import os
 import subprocess
-import sysm
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
