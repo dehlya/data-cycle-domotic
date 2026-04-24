@@ -531,6 +531,37 @@ def create_schemas(venv: Path, install_dir: Path):
                label="Gold schema created", env_extra=env_extra)
 
 
+def import_mysql_dims(venv: Path, install_dir: Path):
+    try:
+        run_script(venv, install_dir, "-m", "etl.bronze_to_silver.import_mysql_to_silver",
+                   label="MySQL dimensions imported to silver")
+    except Exception as e:
+        warn(f"MySQL dim import failed: {e}")
+        warn("Continuing without MySQL dims — gold dim_apartment/room/device will be empty.")
+
+
+def backfill_bronze_silver(venv: Path, install_dir: Path):
+    """Optional: run the full SMB + weather backfill. Can take 20-60 min."""
+    if not sys.stdin.isatty():
+        warn("Non-interactive: skipping backfill. Run manually later: python ingestion/fast_flow/watcher.py --scan")
+        return
+    if not ask_yes_no("Run full SMB + weather backfill now? (20-60 min, can be skipped)", default=False):
+        warn("Skipped. Later: `python ingestion/fast_flow/watcher.py --scan` then `--weather`")
+        return
+    print(f"{DIM}  Scanning SMB + running bronze->silver pipeline...{RESET}")
+    try:
+        run_script(venv, install_dir, "ingestion/fast_flow/watcher.py", "--scan",
+                   label="SMB backfill complete")
+    except Exception as e:
+        warn(f"SMB backfill failed: {e}")
+    print(f"{DIM}  Downloading weather + cleaning to silver...{RESET}")
+    try:
+        run_script(venv, install_dir, "ingestion/fast_flow/watcher.py", "--weather",
+                   label="Weather backfill complete")
+    except Exception as e:
+        warn(f"Weather backfill failed: {e}")
+
+
 def run_initial_etl(venv: Path, install_dir: Path):
     run_script(venv, install_dir, "-m", "etl.silver_to_gold.populate_gold", label="Initial gold ETL complete")
 
@@ -595,25 +626,25 @@ def main():
     print(f"Install target: {BOLD}{install_path}{RESET}")
 
     # ── 1. Prerequisites ────────────────────────────────────────────────────
-    step(1, 8, "Checking prerequisites")
+    step(1, 9, "Checking prerequisites")
     check_python()
     check_cmd("git", "Install Git from https://git-scm.com/downloads")
 
     # ── 2. Clone repo ──────────────────────────────────────────────────────
-    step(2, 8, "Cloning repository")
+    step(2, 9, "Cloning repository")
     clone_repo(install_path)
 
     # ── 3. Write .env ──────────────────────────────────────────────────────
-    step(3, 8, "Writing .env configuration")
+    step(3, 9, "Writing .env configuration")
     write_env(install_path)
 
     # ── 4. Create venv + deps ──────────────────────────────────────────────
-    step(4, 8, "Setting up Python environment")
+    step(4, 9, "Setting up Python environment")
     venv = create_venv(install_path)
     install_deps(venv, install_path)
 
     # ── 5. Pre-flight connectivity checks ─────────────────────────────────
-    step(5, 8, "Pre-flight connectivity checks")
+    step(5, 9, "Pre-flight connectivity checks")
     mount_smb_share()  # best-effort, warns on failure
 
 
@@ -639,7 +670,7 @@ def main():
                       sftp_pw.group(1).strip() if sftp_pw else "")
 
     # ── 6. Create app user + DB, then schemas ──────────────────────────────
-    step(6, 8, "Creating PostgreSQL user, database + schemas")
+    step(6, 9, "Creating PostgreSQL user, database + schemas")
     if not ensure_db_and_user(venv):
         die("DB + user setup failed. Check admin credentials.")
     if db_url and not validate_postgres_app(venv, db_url):
@@ -649,16 +680,21 @@ def main():
     except Exception as e:
         warn(f"Schema creation had issues: {e}")
 
-    # ── 7. Initial ETL ─────────────────────────────────────────────────────
-    step(7, 8, "Running initial ETL (this may take a few minutes)")
+    # ── 7. Bootstrap silver (MySQL dims + optional full backfill) ──────────
+    step(7, 9, "Bootstrapping silver layer")
+    import_mysql_dims(venv, install_path)
+    backfill_bronze_silver(venv, install_path)
+
+    # ── 8. Initial gold ETL ────────────────────────────────────────────────
+    step(8, 9, "Running initial gold ETL")
     try:
         run_initial_etl(venv, install_path)
     except Exception as e:
         warn(f"Initial ETL had issues: {e}")
         warn("You can re-run manually: python -m etl.silver_to_gold.populate_gold")
 
-    # ── 8. Verify ──────────────────────────────────────────────────────────
-    step(8, 8, "Verifying gold data")
+    # ── 9. Verify ──────────────────────────────────────────────────────────
+    step(9, 9, "Verifying gold data")
     if db_url:
         verify_data(venv, db_url)
 

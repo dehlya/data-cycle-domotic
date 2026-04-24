@@ -40,19 +40,27 @@ CREATE INDEX IF NOT EXISTS idx_sensor_events_timestamp   ON silver.sensor_events
 CREATE INDEX IF NOT EXISTS idx_sensor_events_apartment   ON silver.sensor_events (apartment);
 CREATE INDEX IF NOT EXISTS idx_sensor_events_sensor_type ON silver.sensor_events (sensor_type);
 
--- WEATHER CLEAN
-CREATE TABLE IF NOT EXISTS silver.weather_clean (
+-- WEATHER FORECASTS (flat schema — one row per model run x measurement)
+CREATE TABLE IF NOT EXISTS silver.weather_forecasts (
     id               BIGSERIAL PRIMARY KEY,
     timestamp        TIMESTAMPTZ  NOT NULL,
-    site             VARCHAR(50),
-    temperature_c    FLOAT,
-    humidity_pct     FLOAT,
-    precipitation_mm FLOAT,
-    radiation_wm2    FLOAT,
+    site             VARCHAR(100),
+    prediction       SMALLINT,
+    prediction_date  DATE,
+    measurement      VARCHAR(50),
+    value            FLOAT,
+    unit             VARCHAR(20),
     is_outlier       BOOLEAN      DEFAULT FALSE,
-    UNIQUE (timestamp, site)
+    UNIQUE (timestamp, site, prediction, prediction_date, measurement)
 );
-CREATE INDEX IF NOT EXISTS idx_weather_clean_timestamp ON silver.weather_clean (timestamp);
+CREATE INDEX IF NOT EXISTS idx_weather_forecasts_timestamp ON silver.weather_forecasts (timestamp);
+CREATE INDEX IF NOT EXISTS idx_weather_forecasts_pred_date ON silver.weather_forecasts (prediction_date);
+
+-- WEATHER watermark (processed file tracking for clean_weather.py)
+CREATE TABLE IF NOT EXISTS silver.weather_watermark (
+    filename TEXT PRIMARY KEY,
+    processed_at TIMESTAMPTZ DEFAULT NOW()
+);
 
 -- APARTMENT METADATA
 -- TODO: populate from MySQL snapshot (blocked on schema confirmation)
@@ -163,7 +171,7 @@ def run():
 
     print("  Silver schema and tables created (or already exist)")
     print("    silver.sensor_events")
-    print("    silver.weather_clean")
+    print("    silver.weather_forecasts")
     print("    silver.apartment_metadata")
     print("    silver.di_errors_clean\n")
 
