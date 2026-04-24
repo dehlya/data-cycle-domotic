@@ -45,7 +45,7 @@ ENV_CONFIG = """\
 SMB_PATH={{SMB_PATH}}
 BRONZE_ROOT={{BRONZE_ROOT}}
 
-# PostgreSQL (Silver/Gold)
+# PostgreSQL (Silver/Gold) — app user, not admin
 DB_URL={{DB_URL}}
 
 # MySQL source (school DB)
@@ -63,12 +63,21 @@ WEATHER_MIN_YEAR={{WEATHER_MIN_YEAR}}
 # Gold weather
 WEATHER_SITES={{WEATHER_SITES}}
 
-# Power BI connection (Gold schema)
+# Power BI connection (Gold schema) — app user
 PBI_SERVER={{PBI_SERVER}}
 PBI_DATABASE={{PBI_DATABASE}}
 PBI_USER={{PBI_USER}}
 PBI_PASSWORD={{PBI_PASSWORD}}
 """
+
+# Admin credentials — used only during install, never written to .env
+PG_HOST           = "{{PG_HOST}}"
+PG_PORT           = "{{PG_PORT}}"
+PG_ADMIN_USER     = "{{PG_ADMIN_USER}}"
+PG_ADMIN_PASSWORD = "{{PG_ADMIN_PASSWORD}}"
+PG_DATABASE       = "{{PG_DATABASE}}"
+PG_APP_USER       = "{{PG_USER}}"
+PG_APP_PASSWORD   = "{{PG_PASSWORD}}"
 
 REPO_URL = "https://github.com/dehlya/data-cycle-domotic.git"
 REPO_BRANCH = "deploy"
@@ -206,9 +215,8 @@ def run_python_snippet(venv: Path, snippet: str) -> tuple[int, str, str]:
     return res.returncode, res.stdout.strip(), res.stderr.strip()
 
 
-def validate_postgres(venv: Path, db_url: str) -> bool:
-    """Confirm we can reach Postgres (DB may not exist yet — that's fine)."""
-    host, port, user, password, dbname = parse_db_url(db_url)
+def validate_postgres_admin(venv: Path) -> bool:
+    """Confirm we can reach Postgres as admin."""
     snippet = (
         "import sys\n"
         "try:\n"
@@ -216,7 +224,7 @@ def validate_postgres(venv: Path, db_url: str) -> bool:
         "except ImportError:\n"
         "    sys.exit('NO_DRIVER')\n"
         "try:\n"
-        f"    c = psycopg2.connect(host='{host}', port={port}, user='{user}', password='{password}', dbname='postgres', connect_timeout=5)\n"
+        f"    c = psycopg2.connect(host='{PG_HOST}', port={PG_PORT}, user='{PG_ADMIN_USER}', password='''{PG_ADMIN_PASSWORD}''', dbname='postgres', connect_timeout=5)\n"
         "    c.close()\n"
         "    print('OK')\n"
         "except Exception as e:\n"
@@ -224,45 +232,104 @@ def validate_postgres(venv: Path, db_url: str) -> bool:
     )
     rc, out, err = run_python_snippet(venv, snippet)
     if rc == 0:
-        ok(f"PostgreSQL reachable at {host}:{port}")
+        ok(f"PostgreSQL reachable at {PG_HOST}:{PG_PORT} (as {PG_ADMIN_USER})")
         return True
-    fail(f"PostgreSQL unreachable at {host}:{port}", hint=err.strip().splitlines()[0] if err else "")
+    fail(f"Cannot connect to Postgres as {PG_ADMIN_USER}", hint=err.splitlines()[0] if err else "")
     return False
 
 
-def ensure_database_exists(venv: Path, db_url: str) -> bool:
-    """Create the target database if it doesn't exist."""
+def ensure_db_and_user(venv: Path) -> bool:
+    """
+    Using admin creds:
+      1. Create app user if missing (with given password)
+      2. Create target DB if missing (owned by app user)
+      3. Grant all privileges on DB + public schema to app user
+    """
+    snippet = f"""
+import sys, psycopg2
+from psycopg2 import sql
+
+ADMIN_HOST = {PG_HOST!r}
+ADMIN_PORT = {PG_PORT!r}
+ADMIN_USER = {PG_ADMIN_USER!r}
+ADMIN_PWD  = {PG_ADMIN_PASSWORD!r}
+APP_DB     = {PG_DATABASE!r}
+APP_USER   = {PG_APP_USER!r}
+APP_PWD    = {PG_APP_PASSWORD!r}
+
+def connect(dbname):
+    return psycopg2.connect(host=ADMIN_HOST, port=int(ADMIN_PORT),
+                            user=ADMIN_USER, password=ADMIN_PWD,
+                            dbname=dbname, connect_timeout=5)
+
+try:
+    c = connect('postgres'); c.autocommit = True; cur = c.cursor()
+
+    # 1. user
+    cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (APP_USER,))
+    if cur.fetchone() is None:
+        cur.execute(sql.SQL("CREATE ROLE {{}} WITH LOGIN PASSWORD %s").format(sql.Identifier(APP_USER)), (APP_PWD,))
+        print('USER_CREATED')
+    else:
+        cur.execute(sql.SQL("ALTER ROLE {{}} WITH LOGIN PASSWORD %s").format(sql.Identifier(APP_USER)), (APP_PWD,))
+        print('USER_EXISTS')
+
+    # 2. database
+    cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (APP_DB,))
+    if cur.fetchone() is None:
+        cur.execute(sql.SQL("CREATE DATABASE {{}} OWNER {{}}").format(sql.Identifier(APP_DB), sql.Identifier(APP_USER)))
+        print('DB_CREATED')
+    else:
+        print('DB_EXISTS')
+
+    # 3. grants at DB level
+    cur.execute(sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {{}} TO {{}}").format(sql.Identifier(APP_DB), sql.Identifier(APP_USER)))
+    cur.close(); c.close()
+
+    # 4. grants inside the DB (public schema access for create + default schema perms)
+    c = connect(APP_DB); c.autocommit = True; cur = c.cursor()
+    cur.execute(sql.SQL("GRANT ALL ON SCHEMA public TO {{}}").format(sql.Identifier(APP_USER)))
+    cur.close(); c.close()
+
+    print('DONE')
+except Exception as e:
+    sys.exit('FAIL:' + str(e))
+"""
+    rc, out, err = run_python_snippet(venv, snippet)
+    if rc != 0:
+        fail("Could not set up DB + app user as admin", err.splitlines()[0] if err else "")
+        return False
+    lines = out.splitlines()
+    if "USER_CREATED" in lines:
+        ok(f"App user '{PG_APP_USER}' created")
+    elif "USER_EXISTS" in lines:
+        ok(f"App user '{PG_APP_USER}' already exists (password reset)")
+    if "DB_CREATED" in lines:
+        ok(f"Database '{PG_DATABASE}' created (owner: {PG_APP_USER})")
+    elif "DB_EXISTS" in lines:
+        ok(f"Database '{PG_DATABASE}' already exists")
+    ok(f"Privileges granted on '{PG_DATABASE}' to '{PG_APP_USER}'")
+    return True
+
+
+def validate_postgres_app(venv: Path, db_url: str) -> bool:
+    """Confirm the app user can now connect to the target DB."""
     host, port, user, password, dbname = parse_db_url(db_url)
     snippet = (
-        "import sys\n"
-        "import psycopg2\n"
+        "import sys, psycopg2\n"
         "try:\n"
-        f"    c = psycopg2.connect(host='{host}', port={port}, user='{user}', password='{password}', dbname='{dbname}', connect_timeout=5)\n"
+        f"    c = psycopg2.connect(host='{host}', port={port}, user='{user}', password='''{password}''', dbname='{dbname}', connect_timeout=5)\n"
         "    c.close()\n"
-        "    print('EXISTS')\n"
-        "    sys.exit(0)\n"
-        "except psycopg2.OperationalError as e:\n"
-        "    if 'does not exist' not in str(e).lower():\n"
-        "        sys.exit('FAIL:' + str(e))\n"
-        "try:\n"
-        f"    c = psycopg2.connect(host='{host}', port={port}, user='{user}', password='{password}', dbname='postgres', connect_timeout=5)\n"
-        "    c.autocommit = True\n"
-        "    cur = c.cursor()\n"
-        f"    cur.execute('CREATE DATABASE \"{dbname}\"')\n"
-        "    cur.close(); c.close()\n"
-        "    print('CREATED')\n"
+        "    print('OK')\n"
         "except Exception as e:\n"
         "    sys.exit('FAIL:' + str(e))\n"
     )
     rc, out, err = run_python_snippet(venv, snippet)
-    if rc != 0:
-        fail(f"Could not create DB '{dbname}'", err or "")
-        return False
-    if out == "EXISTS":
-        ok(f"Database '{dbname}' already exists")
-    else:
-        ok(f"Database '{dbname}' created")
-    return True
+    if rc == 0:
+        ok(f"App user '{user}' can connect to '{dbname}'")
+        return True
+    fail(f"App user can't connect to '{dbname}'", err.splitlines()[0] if err else "")
+    return False
 
 
 def validate_mysql(venv: Path, mysql_url: str) -> bool:
@@ -474,8 +541,8 @@ def main():
     sftp_pw   = re.search(r"SFTP_PASSWORD=(.*)",ENV_CONFIG)
 
     db_url = db_m.group(1).strip() if db_m else ""
-    if db_url and not validate_postgres(venv, db_url):
-        die("Fix your DB credentials (or start PostgreSQL) and rerun.")
+    if not validate_postgres_admin(venv):
+        die("Fix your admin credentials (or start PostgreSQL) and rerun.")
 
     if mysql_m:
         validate_mysql(venv, mysql_m.group(1).strip())  # warn only, don't die
@@ -486,10 +553,12 @@ def main():
                       sftp_u.group(1).strip() if sftp_u else "",
                       sftp_pw.group(1).strip() if sftp_pw else "")
 
-    # ── 6. Ensure DB + schemas ─────────────────────────────────────────────
-    step(6, 8, "Creating PostgreSQL database + schemas")
-    if db_url:
-        ensure_database_exists(venv, db_url)
+    # ── 6. Create app user + DB, then schemas ──────────────────────────────
+    step(6, 8, "Creating PostgreSQL user, database + schemas")
+    if not ensure_db_and_user(venv):
+        die("DB + user setup failed. Check admin credentials.")
+    if db_url and not validate_postgres_app(venv, db_url):
+        die("App user connection failed. Check username/password.")
     try:
         create_schemas(venv, install_path)
     except Exception as e:
