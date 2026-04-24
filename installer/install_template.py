@@ -500,10 +500,12 @@ def install_deps(venv: Path, install_dir: Path):
     ok("Python dependencies installed")
 
 
-def run_script(venv: Path, install_dir: Path, *args, label=None):
+def run_script(venv: Path, install_dir: Path, *args, label=None, env_extra=None):
     py = venv_python(venv)
     env = os.environ.copy()
     env["PYTHONPATH"] = str(install_dir)
+    if env_extra:
+        env.update(env_extra)
     try:
         subprocess.run([str(py), *args], cwd=str(install_dir), env=env, check=True)
         if label:
@@ -513,9 +515,20 @@ def run_script(venv: Path, install_dir: Path, *args, label=None):
         raise
 
 
+def admin_url() -> str:
+    """Build postgresql://admin:pwd@host:port/postgres for the ETL scripts' DB_ADMIN_URL."""
+    from urllib.parse import quote
+    return (f"postgresql://{quote(PG_ADMIN_USER)}:{quote(PG_ADMIN_PASSWORD)}"
+            f"@{PG_HOST}:{PG_PORT}/postgres")
+
+
 def create_schemas(venv: Path, install_dir: Path):
-    run_script(venv, install_dir, "-m", "etl.bronze_to_silver.create_silver", label="Silver schema created")
-    run_script(venv, install_dir, "-m", "etl.silver_to_gold.create_gold",     label="Gold schema created")
+    # Pass admin URL so create_silver/create_gold can CREATE SCHEMA
+    env_extra = {"DB_ADMIN_URL": admin_url()}
+    run_script(venv, install_dir, "-m", "etl.bronze_to_silver.create_silver",
+               label="Silver schema created", env_extra=env_extra)
+    run_script(venv, install_dir, "-m", "etl.silver_to_gold.create_gold",
+               label="Gold schema created", env_extra=env_extra)
 
 
 def run_initial_etl(venv: Path, install_dir: Path):
