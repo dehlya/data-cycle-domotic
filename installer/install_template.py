@@ -79,6 +79,12 @@ PG_DATABASE       = "{{PG_DATABASE}}"
 PG_APP_USER       = "{{PG_USER}}"
 PG_APP_PASSWORD   = "{{PG_PASSWORD}}"
 
+# SMB share (mount-time only, not written to .env)
+SMB_SHARE    = "{{SMB_SHARE}}"
+SMB_USER     = "{{SMB_USER}}"
+SMB_PASSWORD = "{{SMB_PASSWORD}}"
+SMB_DRIVE    = "{{SMB_DRIVE}}"
+
 REPO_URL = "https://github.com/dehlya/data-cycle-domotic.git"
 REPO_BRANCH = "deploy"
 DEFAULT_INSTALL_DIR = "data-cycle-domotic"
@@ -387,6 +393,43 @@ def validate_sftp(venv: Path, host: str, port: str, user: str, password: str) ->
     return False
 
 
+def mount_smb_share():
+    """Mount the SMB share as a drive on Windows, or skip on other OSes."""
+    if not (SMB_SHARE and SMB_USER and SMB_PASSWORD and SMB_DRIVE):
+        SUMMARY.add_skipped("SMB mount", "credentials not provided")
+        return True
+
+    if os.name != "nt":
+        warn(f"Non-Windows: skipping auto-mount. Mount {SMB_SHARE} at {SMB_DRIVE} manually (mount.cifs) before running the pipeline.")
+        return True
+
+    # Check if already mounted
+    drive_letter = SMB_DRIVE.rstrip("\\").rstrip(":")
+    existing = Path(drive_letter + ":\\")
+    if existing.exists():
+        ok(f"{SMB_DRIVE} already appears mounted")
+        return True
+
+    # net use Z: \\server\share /USER:user password /PERSISTENT:YES
+    try:
+        subprocess.run(
+            ["net", "use", SMB_DRIVE, SMB_SHARE,
+             f"/USER:{SMB_USER}", SMB_PASSWORD,
+             "/PERSISTENT:YES"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        ok(f"Mounted {SMB_SHARE} -> {SMB_DRIVE}")
+        return True
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip().splitlines()
+        hint = stderr[0] if stderr else ""
+        warn(f"Could not mount SMB share: {hint}")
+        warn(f"  You can retry manually: net use {SMB_DRIVE} {SMB_SHARE} /USER:{SMB_USER} <password>")
+        return False
+
+
 def clone_repo(install_dir: Path):
     if install_dir.exists() and any(install_dir.iterdir()):
         warn(f"{install_dir} already exists and is not empty -- skipping clone")
@@ -532,6 +575,9 @@ def main():
 
     # ── 5. Pre-flight connectivity checks ─────────────────────────────────
     step(5, 8, "Pre-flight connectivity checks")
+    mount_smb_share()  # best-effort, warns on failure
+
+
     import re
     db_m      = re.search(r"DB_URL=(.+)",       ENV_CONFIG)
     mysql_m   = re.search(r"MYSQL_URL=(.+)",    ENV_CONFIG)
