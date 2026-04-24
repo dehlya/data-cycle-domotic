@@ -431,15 +431,41 @@ def mount_smb_share():
 
 
 def clone_repo(install_dir: Path):
-    if install_dir.exists() and any(install_dir.iterdir()):
-        warn(f"{install_dir} already exists and is not empty -- skipping clone")
+    # Fresh clone
+    if not install_dir.exists() or not any(install_dir.iterdir()):
+        install_dir.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "clone", "--branch", REPO_BRANCH, "--depth", "1", REPO_URL, str(install_dir)],
+            check=True
+        )
+        ok(f"Repo cloned to {install_dir}")
         return
-    install_dir.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "clone", "--branch", REPO_BRANCH, "--depth", "1", REPO_URL, str(install_dir)],
-        check=True
-    )
-    ok(f"Repo cloned to {install_dir}")
+
+    # Existing dir — try to update it if it's the right repo
+    if not (install_dir / ".git").exists():
+        warn(f"{install_dir} already exists but isn't a git repo -- skipping update")
+        return
+
+    try:
+        # Verify it's our repo
+        res = subprocess.run(["git", "-C", str(install_dir), "remote", "get-url", "origin"],
+                             capture_output=True, text=True, check=True)
+        remote = res.stdout.strip()
+        # Be tolerant of ssh vs https form
+        if "data-cycle-domotic" not in remote:
+            warn(f"{install_dir} is a git repo but points to {remote} -- skipping update")
+            return
+
+        subprocess.run(["git", "-C", str(install_dir), "fetch", "--depth", "1", "origin", REPO_BRANCH],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(install_dir), "checkout", REPO_BRANCH],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(install_dir), "reset", "--hard", f"origin/{REPO_BRANCH}"],
+                       check=True, capture_output=True)
+        ok(f"Repo updated to latest origin/{REPO_BRANCH}")
+    except subprocess.CalledProcessError as e:
+        warn(f"Could not update existing repo: {(e.stderr or b'').decode(errors='ignore').strip() or e}")
+        warn("Delete the folder and rerun for a clean install.")
 
 
 def write_env(install_dir: Path):
