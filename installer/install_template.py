@@ -696,13 +696,15 @@ def deploy_knime_workflows(install_dir: Path):
     return True
 
 
-def maybe_open_knime(install_dir: Path):
-    """Optionally launch KNIME so the user sees the workflows immediately."""
+def maybe_run_predictions(venv: Path, install_dir: Path):
+    """At the end of install, offer to run the KNIME prediction workflows
+    headlessly so predictions land in gold.fact_prediction without the
+    user opening KNIME at all."""
     if not sys.stdin.isatty():
         return
     knime_exe = find_knime()
     if not knime_exe:
-        # Fallback to opening the folder so the user can see the .knwf files
+        # Fallback: just open the folder so the user can see the .knwf files
         folder = install_dir / "ml" / "knime"
         if not folder.exists():
             return
@@ -720,13 +722,25 @@ def maybe_open_knime(install_dir: Path):
             warn(f"Could not open folder: {e}")
         return
 
-    if not ask_yes_no("Launch KNIME Analytics Platform now?", default=False):
+    runner = install_dir / "scripts" / "run_knime_predictions.py"
+    if not runner.exists():
+        warn("scripts/run_knime_predictions.py not found, skipping")
         return
+
+    print()
+    print(f"  {DIM}KNIME workflows can be run now in batch mode (no GUI).{RESET}")
+    print(f"  {DIM}This writes predictions into gold.fact_prediction.{RESET}")
+    print(f"  {DIM}Takes 5-30 minutes depending on data volume.{RESET}")
+    if not ask_yes_no("Run KNIME prediction workflows now?", default=False):
+        warn(f"Skipped. Run later: {DIM}python scripts/run_knime_predictions.py{RESET}")
+        return
+
     try:
-        subprocess.Popen([str(knime_exe)])
-        ok("Launched KNIME")
+        run_script(venv, install_dir, str(runner), label="KNIME predictions complete")
     except Exception as e:
-        warn(f"Could not launch KNIME: {e}")
+        warn(f"Predictions runner failed: {e}")
+        warn(f"Try manually: python scripts/run_knime_predictions.py")
+        warn(f"  (or open the workflow once in KNIME and check the PostgreSQL Connector setup)")
 
 
 def verify_data(venv: Path, db_url: str):
@@ -967,7 +981,7 @@ Flags:
 
     # Interactive: auto-open Power BI + KNIME + start watcher
     maybe_open_powerbi(install_path)
-    maybe_open_knime(install_path)
+    maybe_run_predictions(venv, install_path)
     maybe_start_watcher(venv, install_path)
 
 
