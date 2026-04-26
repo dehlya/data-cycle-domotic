@@ -566,6 +566,59 @@ def run_initial_etl(venv: Path, install_dir: Path):
     run_script(venv, install_dir, "-m", "etl.silver_to_gold.populate_gold", label="Initial gold ETL complete")
 
 
+def configure_bi_knime(venv: Path, install_dir: Path):
+    """Auto-patch .pbix and .knwf files to use the user's local DB."""
+    script = install_dir / "scripts" / "configure_bi_knime.py"
+    if not script.exists():
+        warn("configure_bi_knime.py not in repo, skipping auto-patch")
+        return
+    try:
+        run_script(venv, install_dir, str(script), label="BI + KNIME configured")
+    except Exception as e:
+        warn(f"Auto-patch had issues: {e}")
+        warn("You'll need to repoint Power BI / KNIME manually -- see Next steps below.")
+
+
+def maybe_open_powerbi(install_dir: Path):
+    if not sys.stdin.isatty():
+        return
+    pbix = install_dir / "bi" / "power_bi" / "DataCycleDomotic.pbix"
+    if not pbix.exists():
+        return
+    if not ask_yes_no("Open the Power BI dashboard now?", default=True):
+        return
+    try:
+        if os.name == "nt":
+            os.startfile(str(pbix))   # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(pbix)])
+        else:
+            subprocess.Popen(["xdg-open", str(pbix)])
+        ok("Launched Power BI Desktop")
+    except Exception as e:
+        warn(f"Could not auto-open: {e}")
+
+
+def maybe_open_knime_folder(install_dir: Path):
+    if not sys.stdin.isatty():
+        return
+    folder = install_dir / "ml" / "knime"
+    if not folder.exists():
+        return
+    if not ask_yes_no("Open the KNIME workflows folder?", default=False):
+        return
+    try:
+        if os.name == "nt":
+            os.startfile(str(folder))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder)])
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+        ok(f"Opened {folder}")
+    except Exception as e:
+        warn(f"Could not open folder: {e}")
+
+
 def verify_data(venv: Path, db_url: str):
     """Quick sanity check: count rows in key gold tables."""
     host, port, user, password, dbname = parse_db_url(db_url)
@@ -693,10 +746,11 @@ def main():
         warn(f"Initial ETL had issues: {e}")
         warn("You can re-run manually: python -m etl.silver_to_gold.populate_gold")
 
-    # ── 9. Verify ──────────────────────────────────────────────────────────
-    step(9, 9, "Verifying gold data")
+    # ── 9. Verify + auto-config BI/KNIME ──────────────────────────────────
+    step(9, 9, "Verifying + configuring BI/KNIME")
     if db_url:
         verify_data(venv, db_url)
+    configure_bi_knime(venv, install_path)
 
     # ── Done ───────────────────────────────────────────────────────────────
     print()
@@ -747,7 +801,9 @@ def main():
     print(f"{DIM}Install log saved to install.log{RESET}")
     print()
 
-    # Offer to start the watcher right now
+    # Interactive: auto-open Power BI + KNIME folder + start watcher
+    maybe_open_powerbi(install_path)
+    maybe_open_knime_folder(install_path)
     maybe_start_watcher(venv, install_path)
 
 
