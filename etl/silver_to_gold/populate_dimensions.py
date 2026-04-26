@@ -99,6 +99,33 @@ def populate(engine, log, YE, R):
     except Exception as e:
         log.warning(f"Could not enrich dim_apartment from dim_buildings: {e}")
 
+    # ── Pseudonymise dim_apartment for BI display ─────────────────────────
+    # GDPR: end users (Power BI viewers) shouldn't see resident first names
+    # or building locations. Replace with generic codes. apartment_id is the
+    # internal join key and stays untouched — only display fields are masked.
+    # Set BI_PSEUDONYMISE=false in .env to opt out (deployer's choice).
+    import os
+    if os.getenv("BI_PSEUDONYMISE", "true").lower() != "false":
+        print(f"  {YE}>{R} pseudonymising dim_apartment for BI display...")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                WITH ranked AS (
+                    SELECT apartment_key,
+                           ROW_NUMBER() OVER (ORDER BY apartment_key) AS rn
+                    FROM gold.dim_apartment
+                )
+                UPDATE gold.dim_apartment a
+                SET name          = 'Apartment ' || CHR(64 + r.rn::INTEGER),
+                    building_name = CASE WHEN a.building_id IS NULL THEN NULL
+                                         ELSE 'Building ' || a.building_id::TEXT END,
+                    owner_user_id = NULL
+                FROM ranked r
+                WHERE a.apartment_key = r.apartment_key
+            """))
+            log.info("dim_apartment pseudonymised for BI (name -> 'Apartment A/B/...', building_name -> 'Building N', owner_user_id -> NULL)")
+    else:
+        log.info("dim_apartment pseudonymisation skipped (BI_PSEUDONYMISE=false)")
+
     # ═══════════════════════════════════════════════════════════════════════
     # dim_room
     # ═══════════════════════════════════════════════════════════════════════
