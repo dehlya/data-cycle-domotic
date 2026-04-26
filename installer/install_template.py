@@ -569,16 +569,19 @@ def run_initial_etl(venv: Path, install_dir: Path):
 
 
 def configure_bi_knime(venv: Path, install_dir: Path):
-    """Auto-patch .pbix and .knwf files to use the user's local DB."""
+    """Auto-patch .pbix and .knwf files to use the user's local DB,
+    then deploy the .knwf workflows to the KNIME workspace if KNIME is installed."""
     script = install_dir / "scripts" / "configure_bi_knime.py"
     if not script.exists():
         warn("configure_bi_knime.py not in repo, skipping auto-patch")
-        return
-    try:
-        run_script(venv, install_dir, str(script), label="BI + KNIME configured")
-    except Exception as e:
-        warn(f"Auto-patch had issues: {e}")
-        warn("You'll need to repoint Power BI / KNIME manually -- see Next steps below.")
+    else:
+        try:
+            run_script(venv, install_dir, str(script), label="BI + KNIME configured")
+        except Exception as e:
+            warn(f"Auto-patch had issues: {e}")
+            warn("You'll need to repoint Power BI / KNIME manually -- see Next steps below.")
+    # Auto-deploy the KNIME workflows into the KNIME workspace (if KNIME exists)
+    deploy_knime_workflows(install_dir)
 
 
 def maybe_open_powerbi(install_dir: Path):
@@ -601,24 +604,106 @@ def maybe_open_powerbi(install_dir: Path):
         warn(f"Could not auto-open: {e}")
 
 
-def maybe_open_knime_folder(install_dir: Path):
+def find_knime():
+    """Locate KNIME Analytics Platform on this machine. Returns Path or None."""
+    candidates = []
+    if os.name == "nt":
+        candidates += [
+            Path(r"C:\Program Files\KNIME\knime.exe"),
+            Path(r"C:\Program Files (x86)\KNIME\knime.exe"),
+            Path(os.path.expanduser(r"~\AppData\Local\KNIME\knime.exe")),
+        ]
+    elif sys.platform == "darwin":
+        candidates += [Path("/Applications/KNIME.app/Contents/MacOS/Knime")]
+    else:
+        candidates += [
+            Path("/opt/knime/knime"),
+            Path(os.path.expanduser("~/knime/knime")),
+            Path("/usr/local/bin/knime"),
+        ]
+    for c in candidates:
+        if c.exists():
+            return c
+    on_path = shutil.which("knime")
+    return Path(on_path) if on_path else None
+
+
+def deploy_knime_workflows(install_dir: Path):
+    """If KNIME is installed, extract .knwf files into its workspace
+    so they appear in the Knime Explorer next time KNIME starts."""
+    import zipfile
+    workflows_dir = install_dir / "ml" / "knime"
+    if not workflows_dir.exists():
+        return False
+    knwfs = list(workflows_dir.glob("*.knwf"))
+    if not knwfs:
+        return False
+
+    knime_exe = find_knime()
+    if not knime_exe:
+        warn("KNIME Analytics Platform not detected on this machine.")
+        warn("  The pipeline still works without it -- only the ML predictions step is skipped.")
+        warn("  To enable: install from https://www.knime.com/downloads then rerun this installer")
+        warn("  (it will auto-detect KNIME and drop the workflows into your workspace).")
+        return False
+
+    ok(f"KNIME detected: {knime_exe}")
+
+    # Default KNIME workspace
+    workspace = Path(os.path.expanduser("~/knime-workspace"))
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    deployed = skipped = 0
+    for knwf in knwfs:
+        target = workspace / knwf.stem
+        if target.exists():
+            warn(f"  {knwf.stem} already in {workspace.name}, skipping")
+            skipped += 1
+            continue
+        try:
+            with zipfile.ZipFile(knwf) as zf:
+                zf.extractall(workspace)
+            ok(f"  Deployed {knwf.stem} to KNIME workspace")
+            deployed += 1
+        except Exception as e:
+            warn(f"  Could not deploy {knwf.name}: {e}")
+
+    if deployed > 0:
+        ok(f"{deployed} workflow(s) deployed. Open KNIME -- they will appear in the KNIME Explorer.")
+    return True
+
+
+def maybe_open_knime(install_dir: Path):
+    """Optionally launch KNIME so the user sees the workflows immediately."""
     if not sys.stdin.isatty():
         return
-    folder = install_dir / "ml" / "knime"
-    if not folder.exists():
+    knime_exe = find_knime()
+    if not knime_exe:
+        # Fallback to opening the folder so the user can see the .knwf files
+        folder = install_dir / "ml" / "knime"
+        if not folder.exists():
+            return
+        if not ask_yes_no("Open the KNIME workflows folder?", default=False):
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+            ok(f"Opened {folder}")
+        except Exception as e:
+            warn(f"Could not open folder: {e}")
         return
-    if not ask_yes_no("Open the KNIME workflows folder?", default=False):
+
+    if not ask_yes_no("Launch KNIME Analytics Platform now?", default=False):
         return
     try:
-        if os.name == "nt":
-            os.startfile(str(folder))  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(folder)])
-        else:
-            subprocess.Popen(["xdg-open", str(folder)])
-        ok(f"Opened {folder}")
+        subprocess.Popen([str(knime_exe)])
+        ok("Launched KNIME")
     except Exception as e:
-        warn(f"Could not open folder: {e}")
+        warn(f"Could not launch KNIME: {e}")
 
 
 def verify_data(venv: Path, db_url: str):
@@ -803,9 +888,9 @@ def main():
     print(f"{DIM}Install log saved to install.log{RESET}")
     print()
 
-    # Interactive: auto-open Power BI + KNIME folder + start watcher
+    # Interactive: auto-open Power BI + KNIME + start watcher
     maybe_open_powerbi(install_path)
-    maybe_open_knime_folder(install_path)
+    maybe_open_knime(install_path)
     maybe_start_watcher(venv, install_path)
 
 

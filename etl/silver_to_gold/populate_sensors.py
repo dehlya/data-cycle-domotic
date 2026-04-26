@@ -182,11 +182,26 @@ def populate(engine, log, YE, R, GR):
     # ═══════════════════════════════════════════════════════════════════════
     # Refresh mv_energy_with_cost
     # ═══════════════════════════════════════════════════════════════════════
+    # CONCURRENTLY isn't allowed on the FIRST refresh of an empty MV (Postgres
+    # rule). It also can't sit in the same transaction as a fallback (the
+    # transaction gets poisoned). So each attempt gets its own transaction.
     print(f"\n  {YE}>{R} mv_energy_with_cost (refresh)...")
     t1 = time.monotonic()
-    with engine.begin() as conn:
-        try:
+    refreshed = False
+    try:
+        with engine.begin() as conn:
             conn.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY gold.mv_energy_with_cost"))
-        except Exception:
-            conn.execute(text("REFRESH MATERIALIZED VIEW gold.mv_energy_with_cost"))
+        refreshed = True
+    except Exception as e:
+        log.info(f"mv_energy_with_cost: CONCURRENTLY not possible yet ({str(e)[:60]}...), trying plain REFRESH")
+
+    if not refreshed:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("REFRESH MATERIALIZED VIEW gold.mv_energy_with_cost"))
+            refreshed = True
+        except Exception as e:
+            log.warning(f"mv_energy_with_cost refresh failed: {e}")
+
+    if refreshed:
         log.info(f"mv_energy_with_cost refreshed ({time.monotonic()-t1:.1f}s)")
