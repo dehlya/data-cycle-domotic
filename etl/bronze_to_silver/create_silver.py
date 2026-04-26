@@ -166,6 +166,36 @@ def run():
     try:
         with engine.begin() as conn:
             conn.execute(text(SILVER_TABLES))
+
+            # Transfer ownership of silver schema + all tables + all sequences to
+            # the app user, so clean_weather (which runs as the app user) can
+            # CREATE INDEX, ALTER TABLE etc. without "must be owner" errors.
+            db_user = get_db_user(DB_URL)
+            if db_user:
+                conn.execute(text(f'ALTER SCHEMA silver OWNER TO "{db_user}"'))
+                conn.execute(text(f"""
+                    DO $$ DECLARE r RECORD;
+                    BEGIN
+                      FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'silver' LOOP
+                        EXECUTE 'ALTER TABLE silver.' || quote_ident(r.tablename)
+                                || ' OWNER TO "{db_user}"';
+                      END LOOP;
+                      FOR r IN SELECT sequence_name FROM information_schema.sequences
+                               WHERE sequence_schema = 'silver' LOOP
+                        EXECUTE 'ALTER SEQUENCE silver.' || quote_ident(r.sequence_name)
+                                || ' OWNER TO "{db_user}"';
+                      END LOOP;
+                    END $$;
+                """))
+                conn.execute(text(
+                    f'ALTER DEFAULT PRIVILEGES IN SCHEMA silver '
+                    f'GRANT ALL ON TABLES TO "{db_user}"'
+                ))
+                conn.execute(text(
+                    f'ALTER DEFAULT PRIVILEGES IN SCHEMA silver '
+                    f'GRANT ALL ON SEQUENCES TO "{db_user}"'
+                ))
+                print(f"  Silver schema + all tables/sequences owned by '{db_user}'")
     finally:
         engine.dispose()
 
