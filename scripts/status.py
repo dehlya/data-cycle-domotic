@@ -95,22 +95,39 @@ def check_row_counts(conn):
 
 
 def check_freshness(conn):
-    header("Data freshness")
-    try:
-        latest = conn.execute(text(
-            "SELECT MAX(timestamp_utc) FROM gold.dim_datetime"
-        )).scalar()
-        if not latest:
-            row("Latest data", "no data", "warn")
-            return
-        now = datetime.now(timezone.utc)
-        if latest.tzinfo is None:
-            latest = latest.replace(tzinfo=timezone.utc)
-        age = now - latest
-        ok_status = "ok" if age.total_seconds() < 24 * 3600 else "warn"
-        row("Latest data", f"{latest.strftime('%Y-%m-%d %H:%M UTC')}  ({age} ago)", ok_status)
-    except Exception as e:
-        row("Latest data", f"ERR: {str(e)[:50]}", "fail")
+    header("Data freshness (per source)")
+    now = datetime.now(timezone.utc)
+
+    sources = [
+        ("Sensors (environment)",  "SELECT MAX(d.timestamp_utc) FROM gold.fact_environment_minute f JOIN gold.dim_datetime d ON d.datetime_key = f.datetime_key"),
+        ("Sensors (energy)",       "SELECT MAX(d.timestamp_utc) FROM gold.fact_energy_minute      f JOIN gold.dim_datetime d ON d.datetime_key = f.datetime_key"),
+        ("Sensors (presence)",     "SELECT MAX(d.timestamp_utc) FROM gold.fact_presence_minute    f JOIN gold.dim_datetime d ON d.datetime_key = f.datetime_key"),
+        ("Weather forecasts",      "SELECT MAX(d.timestamp_utc) FROM gold.fact_weather_hour       f JOIN gold.dim_datetime d ON d.datetime_key = f.datetime_key"),
+        ("Device health (daily)",  "SELECT MAX(dt.date) FROM gold.fact_device_health_day h JOIN gold.dim_date dt ON dt.date_key = h.date_key"),
+    ]
+
+    for label, sql in sources:
+        try:
+            latest = conn.execute(text(sql)).scalar()
+            if not latest:
+                row(label, "no data", "warn")
+                continue
+            # Normalise: dim_date returns a date, dim_datetime returns datetime
+            if hasattr(latest, "tzinfo"):
+                if latest.tzinfo is None:
+                    latest = latest.replace(tzinfo=timezone.utc)
+                age = now - latest
+                fmt = latest.strftime('%Y-%m-%d %H:%M UTC')
+            else:
+                # date-only
+                age = now.date() - latest
+                fmt = latest.strftime('%Y-%m-%d')
+            # Status thresholds
+            seconds = age.total_seconds() if hasattr(age, "total_seconds") else age.days * 86400
+            status = "ok" if seconds < 26 * 3600 else ("warn" if seconds < 7 * 86400 else "fail")
+            row(label, f"{fmt}  ({age} ago)", status)
+        except Exception as e:
+            row(label, f"ERR: {str(e)[:50]}", "fail")
 
 
 # ── WATCHER ───────────────────────────────────────────────────────────────────
@@ -149,19 +166,55 @@ def bronze_status():
         row("Folder", f"{BRONZE_ROOT} (not found)", "warn")
         return
 
-    files = list(BRONZE_ROOT.rglob("*.json"))
-    n = len(files)
-    if n == 0:
-        row("Files", "0", "warn")
-        return
-
-    total = sum(f.stat().st_size for f in files)
-    newest = max(files, key=lambda f: f.stat().st_mtime)
-    newest_dt = datetime.fromtimestamp(newest.stat().st_mtime, tz=timezone.utc)
     row("Folder", str(BRONZE_ROOT))
-    row("Files", f"{n:,}", "ok")
-    row("Size", f"{total / 1_000_000:.1f} MB")
-    row("Newest", f"{newest.name} ({newest_dt.strftime('%Y-%m-%d %H:%M UTC')})")
+
+    # Top-level breakdown only — avoid full rglob on 100K+ files.
+    # Per subfolder: walk one level deep, count files only.
+    for sub in sorted(BRONZE_ROOT.iterdir()):
+        if not sub.is_dir():
+            continue
+        # Lazy approximation: count files with os.walk (faster than glob,
+        # interruptible). Stops gracefully on huge trees.
+        n = 0
+        size = 0
+        newest_mtime = 0.0
+        try:
+            for dirpath, _, filenames in os.walk(sub):
+                for f in filenames:
+                    n += 1
+                    full = os.path.join(dirpath, f)
+                    try:
+                        st = os.stat(full)
+                        size += st.st_size
+                        if st.st_mtime > newest_mtime:
+                            newest_mtime = st.st_mtime
+                    except OSError:
+                        pass
+                    if n > 500_000:  # safety cap to keep status snappy
+                        break
+                if n > 500_000:
+                    break
+        except KeyboardInterrupt:
+            row(f"  {sub.name}", "scan interrupted", "warn")
+            continue
+
+        size_mb = size / 1_000_000
+        size_str = f"{size_mb / 1024:.1f} GB" if size_mb >= 1024 else f"{size_mb:.0f} MB"
+        newest_str = ""
+        if newest_mtime:
+            newest_dt = datetime.fromtimestamp(newest_mtime, tz=timezone.utc)
+            newest_str = f"  newest: {newest_dt.strftime('%Y-%m-%d %H:%M')}"
+        cap = " (capped)" if n >= 500_000 else ""
+        row(f"  {sub.name}", f"{n:,} files, {size_str}{cap}{newest_str}", "ok" if n > 0 else "warn")
+
+    # Processed.log if present (from cleanup_bronze)
+    processed_log = BRONZE_ROOT.parent / "processed.log"
+    if processed_log.exists():
+        try:
+            n_processed = sum(1 for _ in processed_log.open(encoding="utf-8"))
+            row("processed.log", f"{n_processed:,} entries (deleted from bronze, do-not-recopy list)", "ok")
+        except Exception:
+            pass
 
 
 # ── LOGS ──────────────────────────────────────────────────────────────────────

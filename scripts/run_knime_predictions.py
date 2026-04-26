@@ -1,0 +1,187 @@
+"""
+run_knime_predictions.py -- Run KNIME prediction workflows in batch mode
+=========================================================================
+Headlessly executes the deployed KNIME workflows so the predictions get
+written to gold.fact_prediction without anyone clicking through the GUI.
+
+Usage:
+    python scripts/run_knime_predictions.py            # run all
+    python scripts/run_knime_predictions.py motion     # only motion
+    python scripts/run_knime_predictions.py consumption# only consumption
+
+Requirements:
+    - KNIME Analytics Platform installed (auto-detected at common paths)
+    - Workflows deployed to ~/knime-workspace (done by the installer's
+      configure_bi_knime step)
+    - DB credentials in .env
+
+Notes on the password:
+    KNIME stores connector passwords encrypted with its own master key,
+    which we can't generate from outside KNIME. So:
+      1. We try to inject the .env DB password as a KNIME credential via
+         the -credential CLI flag.
+      2. If the workflow uses credentials by name, this works automatically.
+      3. If the workflow has the password baked into the connector node,
+         the first run after installer setup will fail with "Required
+         credentials are missing" -- the fix is to open the workflow once
+         in the KNIME GUI, set the password in the PostgreSQL Connector
+         node, save, and rerun this script. After that it stays.
+
+This script is safe to schedule daily (Windows Task Scheduler / cron) to
+keep predictions fresh.
+
+Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+from dotenv import load_dotenv
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
+DB_URL = os.getenv("DB_URL", "")
+
+KNIME_WORKSPACE = Path(os.path.expanduser("~/knime-workspace"))
+WORKFLOWS = {
+    "motion":      "Motion_Prediction_Server",
+    "consumption": "Consumption_Weather_Prediction_Server",
+}
+
+
+# ── ANSI ──────────────────────────────────────────────────────────────────────
+RESET="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"
+GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; BLUE="\033[36m"
+
+if not sys.stdout.isatty():
+    RESET = BOLD = DIM = GREEN = RED = YELLOW = BLUE = ""
+
+
+def header(msg):  print(f"\n{BOLD}{BLUE}== {msg} =={RESET}")
+def ok(msg):      print(f"  {GREEN}\u2713{RESET} {msg}")
+def warn(msg):    print(f"  {YELLOW}\u26a0{RESET} {msg}")
+def fail(msg):    print(f"  {RED}\u2717{RESET} {msg}")
+
+
+# ── KNIME LOCATION ────────────────────────────────────────────────────────────
+def find_knime():
+    """Locate the KNIME executable."""
+    candidates = []
+    if os.name == "nt":
+        candidates += [
+            Path(r"C:\Program Files\KNIME\knime.exe"),
+            Path(r"C:\Program Files (x86)\KNIME\knime.exe"),
+            Path(os.path.expanduser(r"~\AppData\Local\KNIME\knime.exe")),
+        ]
+    elif sys.platform == "darwin":
+        candidates += [Path("/Applications/KNIME.app/Contents/MacOS/Knime")]
+    else:
+        candidates += [
+            Path("/opt/knime/knime"),
+            Path(os.path.expanduser("~/knime/knime")),
+            Path("/usr/local/bin/knime"),
+        ]
+    for c in candidates:
+        if c.exists():
+            return c
+    on_path = shutil.which("knime")
+    return Path(on_path) if on_path else None
+
+
+def parse_db_credentials():
+    """Pull username + password out of DB_URL for the -credential flag."""
+    if not DB_URL:
+        return None, None
+    p = urlparse(DB_URL)
+    return unquote(p.username or ""), unquote(p.password or "")
+
+
+# ── BATCH RUNNER ──────────────────────────────────────────────────────────────
+def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password: str) -> bool:
+    """Run one workflow in batch mode. Returns True on exit code 0."""
+    if not workflow_dir.exists():
+        fail(f"Workflow not found: {workflow_dir}")
+        warn(f"   Run the installer (or scripts/configure_bi_knime.py) to deploy it first.")
+        return False
+
+    print(f"  Running {workflow_dir.name} ...")
+    print(f"  {DIM}(this can take 5-30 min depending on data volume){RESET}")
+
+    cmd = [
+        str(knime_exe),
+        "-consoleLog",
+        "-nosplash",
+        "-reset",
+        "-application", "org.knime.product.KNIME_BATCH_APPLICATION",
+        "-workflowDir=" + str(workflow_dir),
+    ]
+    # Pass the DB credentials as a KNIME credential variable.
+    # Workflow nodes that use the credential 'db' (or similar) will pick it up.
+    if db_user and db_password:
+        cmd.append(f"-credential=db;{db_user};{db_password}")
+
+    t0 = datetime.now()
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    elapsed = (datetime.now() - t0).total_seconds()
+
+    if res.returncode == 0:
+        ok(f"  {workflow_dir.name} completed in {elapsed:.0f}s")
+        return True
+
+    fail(f"  {workflow_dir.name} failed (exit {res.returncode}, {elapsed:.0f}s)")
+    # Print last few lines of output to help debug
+    out_lines = (res.stdout + "\n" + res.stderr).strip().splitlines()
+    for line in out_lines[-15:]:
+        print(f"    {DIM}{line[:140]}{RESET}")
+    return False
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+def main():
+    header("Run KNIME Predictions")
+
+    knime_exe = find_knime()
+    if not knime_exe:
+        fail("KNIME Analytics Platform not detected.")
+        warn("  Install from https://www.knime.com/downloads")
+        sys.exit(1)
+    ok(f"KNIME: {knime_exe}")
+
+    if not KNIME_WORKSPACE.exists():
+        fail(f"KNIME workspace not found: {KNIME_WORKSPACE}")
+        warn("  Run the installer (or scripts/configure_bi_knime.py) to deploy workflows.")
+        sys.exit(1)
+    ok(f"Workspace: {KNIME_WORKSPACE}")
+
+    db_user, db_password = parse_db_credentials()
+    if db_user:
+        ok(f"DB credentials loaded for {db_user}")
+    else:
+        warn("DB_URL not in .env -- workflows will use embedded credentials only")
+
+    # Pick which workflows to run
+    args = [a for a in sys.argv[1:] if a in WORKFLOWS]
+    selected = args if args else list(WORKFLOWS.keys())
+
+    header(f"Running {len(selected)} workflow(s)")
+    successes = failures = 0
+    for key in selected:
+        wf_dir = KNIME_WORKSPACE / WORKFLOWS[key]
+        if run_workflow(knime_exe, wf_dir, db_user, db_password):
+            successes += 1
+        else:
+            failures += 1
+
+    print()
+    print(f"{BOLD}Total:{RESET} {GREEN}{successes} ok{RESET}  {RED}{failures} failed{RESET}\n")
+    sys.exit(0 if failures == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()
