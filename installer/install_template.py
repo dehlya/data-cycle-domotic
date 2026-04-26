@@ -590,18 +590,41 @@ def maybe_open_powerbi(install_dir: Path):
     pbix = install_dir / "bi" / "power_bi" / "DataCycleDomotic.pbix"
     if not pbix.exists():
         return
+    pbi_exe = find_power_bi()
+    if not pbi_exe:
+        warn("Power BI Desktop not installed -- skipping the 'open dashboard' step.")
+        warn(f"  Install from https://www.microsoft.com/en-us/download/details.aspx?id=58494")
+        warn(f"  then double-click: {pbix}")
+        return
     if not ask_yes_no("Open the Power BI dashboard now?", default=True):
         return
     try:
-        if os.name == "nt":
-            os.startfile(str(pbix))   # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(pbix)])
-        else:
-            subprocess.Popen(["xdg-open", str(pbix)])
-        ok("Launched Power BI Desktop")
+        # Launch via the detected exe rather than os.startfile, so we don't
+        # trigger the 'choose an app' dialog if .pbix isn't associated.
+        subprocess.Popen([str(pbi_exe), str(pbix)])
+        ok(f"Launched Power BI Desktop -> {pbix.name}")
     except Exception as e:
         warn(f"Could not auto-open: {e}")
+
+
+def find_power_bi():
+    """Locate Power BI Desktop on Windows. Returns Path or None."""
+    if os.name != "nt":
+        return None  # Power BI Desktop is Windows-only
+    candidates = [
+        Path(r"C:\Program Files\Microsoft Power BI Desktop\bin\PBIDesktop.exe"),
+        Path(r"C:\Program Files (x86)\Microsoft Power BI Desktop\bin\PBIDesktop.exe"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    # Microsoft Store version
+    import glob
+    store_pattern = os.path.expanduser(r"~\AppData\Local\Microsoft\WindowsApps\Microsoft.MicrosoftPowerBIDesktop_*\PBIDesktopStore.exe")
+    matches = glob.glob(store_pattern)
+    if matches:
+        return Path(matches[0])
+    return None
 
 
 def find_knime():
@@ -798,6 +821,22 @@ Flags:
     step(1, 9, "Checking prerequisites")
     check_python()
     check_cmd("git", "Install Git from https://git-scm.com/downloads")
+    # Optional tools — warn but don't die
+    pbi = find_power_bi()
+    if pbi:
+        ok(f"Power BI Desktop: {pbi.name}")
+    else:
+        if os.name == "nt":
+            warn("Power BI Desktop not detected. Pipeline will run, but you won't be able to open the dashboard.")
+            warn("  Install from https://www.microsoft.com/en-us/download/details.aspx?id=58494")
+        else:
+            warn("Power BI Desktop is Windows-only. Skipping dashboard step (pipeline still runs).")
+    knime = find_knime()
+    if knime:
+        ok(f"KNIME: {knime}")
+    else:
+        warn("KNIME Analytics Platform not detected. Pipeline will run, but ML predictions step will be skipped.")
+        warn("  Install from https://www.knime.com/downloads")
 
     # ── 2. Clone repo ──────────────────────────────────────────────────────
     step(2, 9, "Cloning repository")
