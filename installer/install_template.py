@@ -86,7 +86,7 @@ SMB_PASSWORD = "{{SMB_PASSWORD}}"
 SMB_DRIVE    = "{{SMB_DRIVE}}"
 
 REPO_URL = "https://github.com/dehlya/data-cycle-domotic.git"
-REPO_BRANCH = "deploy"
+REPO_BRANCH = "release-final"  # switch to "main" once release-final is merged
 DEFAULT_INSTALL_DIR = "data-cycle-domotic"
 
 # =============================================================================
@@ -718,6 +718,14 @@ def main():
         print(f"     .venv/bin/python ingestion/fast_flow/watcher.py")
     print()
     print(f"  {DIM}3.{RESET} In Power BI: Home -> Refresh (loads latest gold data)")
+    print()
+    print(f"  {DIM}4.{RESET} (Optional) Run the ML predictions in KNIME:")
+    print(f"     - Install KNIME Analytics Platform")
+    print(f"     - File -> Import KNIME Workflow -> select either:")
+    print(f"         {install_path / 'ml' / 'knime' / 'Motion_Prediction_Server.knwf'}")
+    print(f"         {install_path / 'ml' / 'knime' / 'Consumption_Weather_Prediction_Server.knwf'}")
+    print(f"     - Configure the PostgreSQL Connector with your DB credentials, then Run")
+    print(f"     - Predictions land in gold.fact_prediction")
     print()
 
     write_log()
