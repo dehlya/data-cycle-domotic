@@ -15,11 +15,6 @@ venv/
 *.log
 logs/
 
-# Airflow
-airflow.db
-airflow.cfg
-airflow-webserver.pid
-
 # OS
 .DS_Store
 Thumbs.db
@@ -27,3 +22,15 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+.claude/
+
+# Backups left by configure_bi_knime / configure_pbix
+*.knwf.bak
+*.pbix.bak
+
+# KNIME workspace artefacts (only relevant if someone uses ml/knime as a workspace)
+**/.metadata/
+**/internal/
+**/port_*/
+**/.savedWithData
+**/.knimeLock

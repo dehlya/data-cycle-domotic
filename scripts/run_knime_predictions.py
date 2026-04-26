@@ -121,10 +121,13 @@ def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password:
         "-application", "org.knime.product.KNIME_BATCH_APPLICATION",
         "-workflowDir=" + str(workflow_dir),
     ]
-    # Pass the DB credentials as a KNIME credential variable.
-    # Workflow nodes that use the credential 'db' (or similar) will pick it up.
+    # Pass the DB credentials as KNIME Workflow Variables (most reliable per
+    # KNIME docs). The workflows must define string variables 'db_user' and
+    # 'db_pwd' (no value) and bind their PostgreSQL Connector username +
+    # password fields to those variables. See ml/knime/SETUP.md.
     if db_user and db_password:
-        cmd.append(f"-credential=db;{db_user};{db_password}")
+        cmd.append(f"-workflow.variable=db_user,{db_user},String")
+        cmd.append(f"-workflow.variable=db_pwd,{db_password},String")
 
     t0 = datetime.now()
     res = subprocess.run(cmd, capture_output=True, text=True)

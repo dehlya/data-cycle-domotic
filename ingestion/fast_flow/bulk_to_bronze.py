@@ -36,6 +36,26 @@ SMB_PATH    = Path(os.getenv("SMB_PATH",    r"Z:\\"))
 BRONZE_ROOT = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
 WORKERS     = 16
 
+# Files in this log were already imported to silver and intentionally deleted
+# from bronze (by scripts/cleanup_bronze.py). Skip them on every scan so the
+# nightly full-scan doesn't re-copy them from SMB.
+PROCESSED_LOG = BRONZE_ROOT.parent / "processed.log"
+
+
+def load_processed_filenames():
+    """Load the set of bronze filenames already processed + cleaned up."""
+    if not PROCESSED_LOG.exists():
+        return set()
+    try:
+        with PROCESSED_LOG.open(encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except Exception:
+        return set()
+
+
+PROCESSED = load_processed_filenames()
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("bulk_to_bronze")
 
@@ -123,6 +143,10 @@ def find_new_files_predict(after_filename):
             if smb_file.exists():
                 apt_local = identify_apartment(filename)
                 if apt_local:
+                    # Skip if this file was already imported + cleaned up.
+                    if filename in PROCESSED:
+                        found_this_minute = True
+                        continue
                     dst = bronze_dest(apt_local, current_dt, filename)
                     if not dst.exists():
                         new_files.append((smb_file, dst))
@@ -157,6 +181,7 @@ def find_new_files_full():
     if not all_files:
         return []
 
+    log.info(f"Skip-list (already imported + cleaned): {len(PROCESSED):,} filenames")
     log.info("Checking newest first...")
     new_files = []
     consecutive_existing = 0
@@ -164,6 +189,12 @@ def find_new_files_full():
     for name in reversed(all_files):
         apt = identify_apartment(name)
         if not apt:
+            continue
+        # Skip if this file was already imported + cleaned up from bronze.
+        if name in PROCESSED:
+            consecutive_existing += 1
+            if consecutive_existing >= 50:
+                break
             continue
         ts  = parse_filename_timestamp(name)
         dst = BRONZE_ROOT / apt / ts.strftime("%Y") / ts.strftime("%m") / ts.strftime("%d") / ts.strftime("%H") / name

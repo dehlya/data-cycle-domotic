@@ -225,13 +225,17 @@ CREATE TABLE IF NOT EXISTS gold.fact_weather_hour (
 
 CREATE INDEX IF NOT EXISTS idx_fweather_date ON gold.fact_weather_hour (date_key);
 
--- ── FACT: prediction (blocked on Johann ML sprint) ──────────────────────────
--- Uncomment when ML sprint is done.
-
--- CREATE TABLE IF NOT EXISTS gold.dim_model ( ... );
--- CREATE TABLE IF NOT EXISTS gold.dim_horizon ( ... );
--- CREATE TABLE IF NOT EXISTS gold.dim_target ( ... );
--- CREATE TABLE IF NOT EXISTS gold.fact_prediction ( ... );
+-- ── FACT: ML predictions ────────────────────────────────────────────────────
+-- Created on the fly by the KNIME DB Writer node when scripts/run_knime_predictions.py
+-- runs the workflows. Two tables, one per use case:
+--   gold.fact_prediction_motion       — Motion_Prediction_Server.knwf
+--     (predicted_occupied, actual_occupied, apartment, room, timestamp_rounded,
+--      model_name='logistic_regression', target='Presence')
+--   gold.fact_prediction_consumption  — Consumption_Weather_Prediction_Server.knwf
+--     (predicted_power_w, actual_power_w, apartment, room, timestamp_rounded,
+--      model_name='linear_regression', target='Consumption')
+-- We don't pre-create them here because KNIME defines the column types based on
+-- its workflow output. See ml/knime/SETUP.md.
 """
 
 
