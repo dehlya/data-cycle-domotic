@@ -760,10 +760,39 @@ def maybe_start_watcher(venv: Path, install_dir: Path):
 def main():
     banner()
 
-    install_path = Path(sys.argv[1]).expanduser().resolve() if len(sys.argv) > 1 \
+    # ── Parse args (positional: install path; flags: --skip-* / --help) ──
+    flags = {a for a in sys.argv[1:] if a.startswith("-")}
+    positional = [a for a in sys.argv[1:] if not a.startswith("-")]
+
+    if "-h" in flags or "--help" in flags:
+        print("""
+Usage: python data-cycle-installer.py [path] [flags]
+
+  path            Where to install (default: ./data-cycle-domotic)
+
+Flags:
+  --skip-etl      Skip the initial gold ETL (step 8). Useful when you just
+                  want to update the repo / redeploy KNIME workflows / refresh
+                  configs without waiting for the full silver -> gold rebuild.
+  --skip-mysql    Skip the MySQL dim sync inside step 7.
+  --skip-deps     Skip 'pip install -r requirements.txt' (assumes venv is OK).
+  -h, --help      Show this message.
+""")
+        sys.exit(0)
+
+    SKIP_ETL   = "--skip-etl"   in flags
+    SKIP_MYSQL = "--skip-mysql" in flags
+    SKIP_DEPS  = "--skip-deps"  in flags
+
+    install_path = Path(positional[0]).expanduser().resolve() if positional \
                    else Path.cwd() / DEFAULT_INSTALL_DIR
 
     print(f"Install target: {BOLD}{install_path}{RESET}")
+    if SKIP_ETL or SKIP_MYSQL or SKIP_DEPS:
+        skipped = ", ".join(f for f in ["etl" if SKIP_ETL else None,
+                                        "mysql" if SKIP_MYSQL else None,
+                                        "deps" if SKIP_DEPS else None] if f)
+        print(f"Skipping: {YELLOW}{skipped}{RESET}")
 
     # ── 1. Prerequisites ────────────────────────────────────────────────────
     step(1, 9, "Checking prerequisites")
@@ -781,7 +810,10 @@ def main():
     # ── 4. Create venv + deps ──────────────────────────────────────────────
     step(4, 9, "Setting up Python environment")
     venv = create_venv(install_path)
-    install_deps(venv, install_path)
+    if SKIP_DEPS:
+        warn("--skip-deps set, leaving venv as-is")
+    else:
+        install_deps(venv, install_path)
 
     # ── 5. Pre-flight connectivity checks ─────────────────────────────────
     step(5, 9, "Pre-flight connectivity checks")
@@ -822,16 +854,22 @@ def main():
 
     # ── 7. Bootstrap silver (MySQL dims + optional full backfill) ──────────
     step(7, 9, "Bootstrapping silver layer")
-    import_mysql_dims(venv, install_path)
+    if SKIP_MYSQL:
+        warn("--skip-mysql set, skipping MySQL dim import")
+    else:
+        import_mysql_dims(venv, install_path)
     backfill_bronze_silver(venv, install_path)
 
     # ── 8. Initial gold ETL ────────────────────────────────────────────────
     step(8, 9, "Running initial gold ETL")
-    try:
-        run_initial_etl(venv, install_path)
-    except Exception as e:
-        warn(f"Initial ETL had issues: {e}")
-        warn("You can re-run manually: python -m etl.silver_to_gold.populate_gold")
+    if SKIP_ETL:
+        warn("--skip-etl set, skipping populate_gold (run manually with: python -m etl.silver_to_gold.populate_gold)")
+    else:
+        try:
+            run_initial_etl(venv, install_path)
+        except Exception as e:
+            warn(f"Initial ETL had issues: {e}")
+            warn("You can re-run manually: python -m etl.silver_to_gold.populate_gold")
 
     # ── 9. Verify + auto-config BI/KNIME ──────────────────────────────────
     step(9, 9, "Verifying + configuring BI/KNIME")
