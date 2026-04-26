@@ -456,11 +456,13 @@ def clone_repo(install_dir: Path):
             warn(f"{install_dir} is a git repo but points to {remote} -- skipping update")
             return
 
+        # Fetch the branch (creates/updates FETCH_HEAD even on shallow clones
+        # that were originally cloned with --branch=different)
         subprocess.run(["git", "-C", str(install_dir), "fetch", "--depth", "1", "origin", REPO_BRANCH],
                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(install_dir), "checkout", REPO_BRANCH],
-                       check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(install_dir), "reset", "--hard", f"origin/{REPO_BRANCH}"],
+        # Create or reset the local branch to point at what we just fetched,
+        # then switch to it. Works even if the local repo never had this branch.
+        subprocess.run(["git", "-C", str(install_dir), "checkout", "-B", REPO_BRANCH, "FETCH_HEAD"],
                        check=True, capture_output=True)
         ok(f"Repo updated to latest origin/{REPO_BRANCH}")
     except subprocess.CalledProcessError as e:
