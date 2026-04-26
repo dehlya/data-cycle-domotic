@@ -144,5 +144,9 @@ Each environment has its own `.env` file. The VM runs the prod environment with 
 |---|---|---|
 | ADR-001 | Python + asyncio for ingestion | I/O-bound task, async allows concurrent sensor polling within 60s |
 | ADR-002 | PostgreSQL for Silver and Gold | Multi-user, Power BI connector, proper SQL for OLAP |
-| ADR-003 | Apache Airflow for orchestration | DAG visibility, retry logic, logging |
+| ADR-003 | Custom watcher over Airflow | Single-VM deploy, zero infrastructure, trivially restartable |
 | ADR-004 | File system for Bronze | Immutable, no overhead, easy to inspect |
+| ADR-005 | Self-contained installer | One-command deploy, credentials never leave deployer's machine |
+| ADR-006 | Two PostgreSQL roles (admin + app) | Least-privilege at runtime, admin secret never persisted |
+| ADR-007 | Mask PII in gold dim_apartment | GDPR Art. 4(1): keep first-name pseudonym, mask the rest |
+| ADR-008 | Watcher revisited at deploy time | Right size for < 10 apartments on a single VM |
