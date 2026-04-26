@@ -74,8 +74,9 @@ def populate(engine, log, YE, R, GR):
             FROM silver.sensor_events se
             JOIN gold.dim_apartment a ON a.apartment_id = se.apartment
             JOIN gold.dim_room r ON r.room_name = se.room AND r.apartment_key = a.apartment_key
-            WHERE se.sensor_type IN ('meteo', 'humidity', 'door', 'window', 'motion')
-              AND se.field NOT IN ('battery', 'motion', 'open', 'light')
+            WHERE se.sensor_type IN ('meteo', 'humidity', 'door', 'window')
+              AND se.field IN ('temperature_c', 'temperature', 'humidity_pct', 'humidity',
+                               'co2_ppm', 'noise_db', 'pressure_hpa', 'open')
             GROUP BY date_trunc('minute', se.timestamp), se.timestamp::date, r.room_key, a.apartment_key
             ON CONFLICT (datetime_key, room_key) DO UPDATE SET
                 temperature_c = EXCLUDED.temperature_c, humidity_pct = EXCLUDED.humidity_pct,
@@ -104,10 +105,7 @@ def populate(engine, log, YE, R, GR):
                 SUM(CASE WHEN se.sensor_type = 'motion' AND se.field = 'motion'
                           AND se.value = 1.0 THEN 1 ELSE 0 END)::INTEGER,
                 BOOL_OR(CASE WHEN se.sensor_type = 'door' AND se.field = 'open' THEN se.value = 1.0 END),
-                BOOL_OR(
-                    (se.sensor_type = 'motion' AND se.field = 'motion' AND se.value = 1.0) OR
-                    (se.sensor_type = 'door' AND se.field = 'open' AND se.value = 1.0)
-                ),
+                BOOL_OR(se.sensor_type = 'motion' AND se.field = 'motion' AND se.value = 1.0),
                 NULL::FLOAT
             FROM silver.sensor_events se
             JOIN gold.dim_apartment a ON a.apartment_id = se.apartment

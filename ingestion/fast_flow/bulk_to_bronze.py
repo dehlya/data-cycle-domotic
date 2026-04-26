@@ -70,6 +70,7 @@ def bronze_dest(apartment, ts, filename):
 
 def copy_file(src, dst):
     try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(src), str(dst))
         return "copied"
     except Exception as e:

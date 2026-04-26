@@ -1,0 +1,105 @@
+// ============================================================================
+// DAX Measures -- Data Cycle Domotic
+// ============================================================================
+// Copy-paste these into Power BI Desktop > Modeling > New Measure
+// All measures reference the Gold star schema tables.
+//
+// Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
+// ============================================================================
+
+
+// ── ENERGY ─────────────────────────────────────────────────────────────────
+
+// Total energy consumed (kWh)
+Total Energy (kWh) =
+    SUM(fact_energy_minute[energy_kwh])
+
+// Total energy cost (CHF) -- from materialized view
+Total Cost (CHF) =
+    SUM(mv_energy_with_cost[cost_chf])
+
+// Average power draw (W)
+Avg Power (W) =
+    AVERAGE(fact_energy_minute[power_w])
+
+// Peak power draw (W)
+Peak Power (W) =
+    MAX(fact_energy_minute[power_w])
+
+// Energy cost per day
+Daily Cost (CHF) =
+    DIVIDE([Total Cost (CHF)], DISTINCTCOUNT(dim_date[date]))
+
+
+// ── ENVIRONMENT ────────────────────────────────────────────────────────────
+
+// Average indoor temperature
+Avg Indoor Temp (C) =
+    AVERAGE(fact_environment_minute[temperature_c])
+
+// Average indoor humidity
+Avg Indoor Humidity (%) =
+    AVERAGE(fact_environment_minute[humidity_pct])
+
+// Average CO2 level
+Avg CO2 (ppm) =
+    AVERAGE(fact_environment_minute[co2_ppm])
+
+// Anomaly rate
+Anomaly Rate (%) =
+    DIVIDE(
+        COUNTROWS(FILTER(fact_environment_minute, fact_environment_minute[is_anomaly] = TRUE)),
+        COUNTROWS(fact_environment_minute)
+    ) * 100
+
+
+// ── PRESENCE ───────────────────────────────────────────────────────────────
+
+// Occupancy rate (% of time someone is present)
+Occupancy Rate (%) =
+    DIVIDE(
+        COUNTROWS(FILTER(fact_presence_minute, fact_presence_minute[presence_flag] = TRUE)),
+        COUNTROWS(fact_presence_minute)
+    ) * 100
+
+// Total motion events
+Total Motion Events =
+    SUM(fact_presence_minute[motion_count])
+
+
+// ── WEATHER ────────────────────────────────────────────────────────────────
+
+// Average outdoor temperature
+Avg Outdoor Temp (C) =
+    AVERAGE(fact_weather_hour[temperature_c])
+
+// Average outdoor humidity
+Avg Outdoor Humidity (%) =
+    AVERAGE(fact_weather_hour[humidity_pct])
+
+// Total precipitation
+Total Precipitation (mm) =
+    SUM(fact_weather_hour[precipitation_mm])
+
+// Average solar radiation
+Avg Radiation (W/m2) =
+    AVERAGE(fact_weather_hour[radiation_wm2])
+
+// Indoor vs outdoor temperature delta
+Temp Delta Indoor-Outdoor (C) =
+    [Avg Indoor Temp (C)] - [Avg Outdoor Temp (C)]
+
+
+// ── DEVICE HEALTH ──────────────────────────────────────────────────────────
+
+// Average device uptime
+Avg Uptime (%) =
+    AVERAGE(fact_device_health_day[uptime_pct])
+
+// Total missing readings
+Total Missing Readings =
+    SUM(fact_device_health_day[missing_readings])
+
+// Average battery level
+Avg Battery (%) =
+    AVERAGE(fact_device_health_day[battery_avg_pct])

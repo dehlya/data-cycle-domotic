@@ -40,19 +40,27 @@ CREATE INDEX IF NOT EXISTS idx_sensor_events_timestamp   ON silver.sensor_events
 CREATE INDEX IF NOT EXISTS idx_sensor_events_apartment   ON silver.sensor_events (apartment);
 CREATE INDEX IF NOT EXISTS idx_sensor_events_sensor_type ON silver.sensor_events (sensor_type);
 
--- WEATHER CLEAN
-CREATE TABLE IF NOT EXISTS silver.weather_clean (
+-- WEATHER FORECASTS (flat schema — one row per model run x measurement)
+CREATE TABLE IF NOT EXISTS silver.weather_forecasts (
     id               BIGSERIAL PRIMARY KEY,
     timestamp        TIMESTAMPTZ  NOT NULL,
-    site             VARCHAR(50),
-    temperature_c    FLOAT,
-    humidity_pct     FLOAT,
-    precipitation_mm FLOAT,
-    radiation_wm2    FLOAT,
+    site             VARCHAR(100),
+    prediction       SMALLINT,
+    prediction_date  DATE,
+    measurement      VARCHAR(50),
+    value            FLOAT,
+    unit             VARCHAR(20),
     is_outlier       BOOLEAN      DEFAULT FALSE,
-    UNIQUE (timestamp, site)
+    UNIQUE (timestamp, site, prediction, prediction_date, measurement)
 );
-CREATE INDEX IF NOT EXISTS idx_weather_clean_timestamp ON silver.weather_clean (timestamp);
+CREATE INDEX IF NOT EXISTS idx_weather_forecasts_timestamp ON silver.weather_forecasts (timestamp);
+CREATE INDEX IF NOT EXISTS idx_weather_forecasts_pred_date ON silver.weather_forecasts (prediction_date);
+
+-- WEATHER watermark (processed file tracking for clean_weather.py)
+CREATE TABLE IF NOT EXISTS silver.weather_watermark (
+    filename TEXT PRIMARY KEY,
+    processed_at TIMESTAMPTZ DEFAULT NOW()
+);
 
 -- APARTMENT METADATA
 -- TODO: populate from MySQL snapshot (blocked on schema confirmation)
@@ -158,12 +166,42 @@ def run():
     try:
         with engine.begin() as conn:
             conn.execute(text(SILVER_TABLES))
+
+            # Transfer ownership of silver schema + all tables + all sequences to
+            # the app user, so clean_weather (which runs as the app user) can
+            # CREATE INDEX, ALTER TABLE etc. without "must be owner" errors.
+            db_user = get_db_user(DB_URL)
+            if db_user:
+                conn.execute(text(f'ALTER SCHEMA silver OWNER TO "{db_user}"'))
+                conn.execute(text(f"""
+                    DO $$ DECLARE r RECORD;
+                    BEGIN
+                      FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'silver' LOOP
+                        EXECUTE 'ALTER TABLE silver.' || quote_ident(r.tablename)
+                                || ' OWNER TO "{db_user}"';
+                      END LOOP;
+                      FOR r IN SELECT sequence_name FROM information_schema.sequences
+                               WHERE sequence_schema = 'silver' LOOP
+                        EXECUTE 'ALTER SEQUENCE silver.' || quote_ident(r.sequence_name)
+                                || ' OWNER TO "{db_user}"';
+                      END LOOP;
+                    END $$;
+                """))
+                conn.execute(text(
+                    f'ALTER DEFAULT PRIVILEGES IN SCHEMA silver '
+                    f'GRANT ALL ON TABLES TO "{db_user}"'
+                ))
+                conn.execute(text(
+                    f'ALTER DEFAULT PRIVILEGES IN SCHEMA silver '
+                    f'GRANT ALL ON SEQUENCES TO "{db_user}"'
+                ))
+                print(f"  Silver schema + all tables/sequences owned by '{db_user}'")
     finally:
         engine.dispose()
 
     print("  Silver schema and tables created (or already exist)")
     print("    silver.sensor_events")
-    print("    silver.weather_clean")
+    print("    silver.weather_forecasts")
     print("    silver.apartment_metadata")
     print("    silver.di_errors_clean\n")
 
