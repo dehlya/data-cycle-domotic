@@ -6,10 +6,17 @@ runs need no manual steps.
 
 ## Why
 
-The `.knwf` files have the PostgreSQL Connector node with Sacha's password
-encrypted into them. After deployment we need any user's password to work,
-so we replace the inline password with a **Workflow Variable** that batch
-mode can inject from the command line.
+The `.knwf` files were originally exported with the PostgreSQL Connector
+password encrypted with Sacha's KNIME master key. After deployment we
+need any user's password to work, so we rewire the connectors to use a
+**Workflow Credential** that batch mode can fill from the command line
+via `-credential=db;<user>;<password>`.
+
+> **Important — why not flow variables?** KNIME deliberately forbids
+> overwriting password fields via flow variables (`It's not possible to
+> overwrite passwords with flow variables`). The only batch-mode-safe
+> mechanism for passwords is `-credential` targeting a Workflow
+> Credential. Don't waste time on `-workflow.variable=db_pwd,...`.
 
 ## Steps (5 min per workflow)
 
@@ -18,34 +25,34 @@ For both `Motion_Prediction_Server.knwf` and
 
 1. **Open the workflow in KNIME Analytics Platform.**
 
-2. **Add two Workflow Variables**
-   - In the **Explorer panel** (left sidebar, not the canvas), right-click
-     the workflow → **Workflow Variables...**
-   - Click **Add** → name `db_user`, type **String**, value (leave empty)
-   - Click **Add** → name `db_pwd`, type **String**, value (leave empty)
+2. **Add a Workflow Credential named `db`**
+   - In the **Explorer panel** (left sidebar, NOT the canvas), right-click
+     the workflow → **Workflow Credentials...**
+   - Click **Add**
+     - **Name:** `db`
+     - **Login:** leave empty (filled at runtime)
+     - **Password:** leave empty (filled at runtime)
    - OK
-   - *(If "Workflow Variables" is missing in your KNIME version, instead use
-     a **Configuration Node** with two String Input nodes — same idea.)*
 
-3. **Bind the PostgreSQL Connector fields to those variables**
+3. **Bind every PostgreSQL Connector to that credential**
 
-   For **each** PostgreSQL Connector node in the workflow (use the diagnostic
-   in `scripts/status.py` or just expand all components to find them):
+   For **each** PostgreSQL Connector node in the workflow (use
+   `scripts/status.py` or expand all components to find them):
 
    1. Double-click the node → **Authentication** tab
-   2. Switch to **"Username & password"** mode (NOT "Use credentials")
-   3. **Click the small "v" icon** at the right of the Username field →
-      from the dropdown, pick **"db_user"**
-   4. Same for the Password field → bind to **"db_pwd"**
-   5. OK
+   2. Switch to **"Use credentials"** mode (NOT "Username & password")
+   3. From the dropdown, select **`db`**
+   4. OK
 
    The Connection Settings tab still has host / port / database hardcoded —
    leave those as-is (they're patched per-deployer by `configure_bi_knime.py`).
 
 4. **Remove any leftover credential setup** from earlier attempts:
    - Delete any **Credentials Configuration** node that's no longer wired
-   - Right-click workflow → **Workflow Credentials** → remove any `db` entry
-   - The PG Connector should ONLY rely on the two Workflow Variables now
+   - Delete any **String Configuration** node named `db_user` / `db_pwd`
+   - Right-click workflow → **Workflow Variables...** → remove `db_user`
+     and `db_pwd` if they exist
+   - The PG Connectors should ONLY use the `db` Workflow Credential now
 
 5. **Save** the workflow (Ctrl+S)
 
@@ -59,10 +66,10 @@ For both `Motion_Prediction_Server.knwf` and
 
    The runner injects:
    ```
-   -workflow.variable=db_user,<your-user>,String
-   -workflow.variable=db_pwd,<your-password>,String
+   -credential=db;<your-user>;<your-password>
    ```
-   and KNIME's batch executor passes those values to your bound fields.
+   and KNIME's batch executor fills the `db` Workflow Credential before
+   any PG Connector executes.
 
 ## Verify
 
@@ -83,16 +90,19 @@ SELECT model_name, target, COUNT(*) FROM gold.fact_prediction_consumption  GROUP
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Database host is not defined` (×N warnings) | Some PG Connector still has empty host or empty bound variable | Check ALL connectors (use `scripts/status.py` or grep `host` field in settings.xml) |
+| `Attempt to overwrite the password with config key 'password' failed` | A PG Connector is still in "Username & password" mode with the password bound to a flow variable | Switch the node's Authentication tab to "Use credentials" → `db` |
+| `Database host is not defined` (×N warnings) | Some PG Connector still has empty host or upstream connector failed | Check ALL connectors (use `scripts/status.py` or grep `host` field in settings.xml) |
 | `Java exit code=4` immediately after launch | KNIME GUI is open with the same workspace | Close KNIME GUI before running batch |
-| `Username: 'X', Password: not provided` | Variable binding didn't take | Re-open Authentication tab, re-bind Username/Password to `db_user`/`db_pwd` |
+| `Required credentials are missing` | The Workflow Credential `db` doesn't exist on the workflow | Re-do step 2 (right-click workflow → Workflow Credentials → Add `db`) |
 | Workflow runs but writes 0 rows | Upstream filters too restrictive (e.g. no rows in time range) | Open in KNIME, run interactively to see where it stops |
 
 ## For future-Sacha (keeping this clean)
 
 If you change the workflows further, please:
-1. Keep using `db_user` and `db_pwd` as the variable names (the runner
-   script depends on them)
-2. Re-export the .knwf so the repo always has the latest credential-aware
+1. Keep using the Workflow Credential name `db` (the runner script
+   passes `-credential=db;...`)
+2. Keep every PG Connector in "Use credentials" mode bound to `db` —
+   never re-introduce inline passwords or flow-variable password binding
+3. Re-export the .knwf so the repo always has the latest credential-aware
    version
-3. Test with `python scripts/run_knime_predictions.py` before pushing
+4. Test with `python scripts/run_knime_predictions.py` before pushing

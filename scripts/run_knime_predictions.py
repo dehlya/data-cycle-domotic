@@ -16,16 +16,16 @@ Requirements:
     - DB credentials in .env
 
 Notes on the password:
-    KNIME stores connector passwords encrypted with its own master key,
-    which we can't generate from outside KNIME. So:
-      1. We try to inject the .env DB password as a KNIME credential via
-         the -credential CLI flag.
-      2. If the workflow uses credentials by name, this works automatically.
-      3. If the workflow has the password baked into the connector node,
-         the first run after installer setup will fail with "Required
-         credentials are missing" -- the fix is to open the workflow once
-         in the KNIME GUI, set the password in the PostgreSQL Connector
-         node, save, and rerun this script. After that it stays.
+    KNIME forbids overwriting password fields via flow variables for
+    security reasons ("It's not possible to overwrite passwords with flow
+    variables"). So we use **Workflow Credentials** instead:
+      1. Each workflow has a Workflow Credential named 'db' (created once
+         in KNIME GUI: right-click workflow -> Workflow Credentials -> Add
+         'db' with empty user/password). See ml/knime/SETUP.md.
+      2. Each PostgreSQL Connector is set to "Use credentials" -> 'db'.
+      3. We inject username + password at runtime via:
+            -credential=db;<user>;<password>
+         which IS allowed by KNIME for Workflow Credentials.
 
 This script is safe to schedule daily (Windows Task Scheduler / cron) to
 keep predictions fresh.
@@ -121,13 +121,13 @@ def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password:
         "-application", "org.knime.product.KNIME_BATCH_APPLICATION",
         "-workflowDir=" + str(workflow_dir),
     ]
-    # Pass the DB credentials as KNIME Workflow Variables (most reliable per
-    # KNIME docs). The workflows must define string variables 'db_user' and
-    # 'db_pwd' (no value) and bind their PostgreSQL Connector username +
-    # password fields to those variables. See ml/knime/SETUP.md.
+    # Inject DB credentials via the -credential flag, which targets the
+    # workflow's Workflow Credentials entry named 'db'. KNIME allows this
+    # but explicitly forbids overwriting password fields via flow variables,
+    # which is why we don't use -workflow.variable for the password.
+    # See ml/knime/SETUP.md.
     if db_user and db_password:
-        cmd.append(f"-workflow.variable=db_user,{db_user},String")
-        cmd.append(f"-workflow.variable=db_pwd,{db_password},String")
+        cmd.append(f"-credential=db;{db_user};{db_password}")
 
     t0 = datetime.now()
     res = subprocess.run(cmd, capture_output=True, text=True)
