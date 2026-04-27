@@ -149,21 +149,17 @@ def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password:
         "-application", "org.knime.product.KNIME_BATCH_APPLICATION",
         "-workflowDir=" + str(workflow_dir),
     ]
-    # Inject DB credentials into every Credentials Configuration node via
-    # the -option=<NODE_ID>,<PARAM_NAME>,<VALUE>,<TYPE> flag.
-    # For credentials, VALUE is "user;password" and TYPE is "credentials".
-    # Documented KNIME batch syntax for Credentials Configuration nodes
-    # (different from -credential which targets Workflow Credentials, and
-    # from -workflow.variable which KNIME blocks for passwords).
-    if db_user and db_password:
-        cred_nodes = find_credential_config_nodes(workflow_dir)
-        if cred_nodes:
-            for node_id, param_name in cred_nodes:
-                value = f"{db_user};{db_password}"
-                cmd.append(f"-option={node_id},{param_name},{value},credentials")
-                print(f"  {DIM}injecting credential into node #{node_id} (param={param_name}){RESET}")
-        else:
-            warn("  No Credentials Configuration node found; relying on baked-in password")
+    # No runtime password injection.
+    # KNIME blocks all CLI mechanisms for setting Credentials Configuration
+    # passwords (flow variables, -credential flag, -option flag — none accept
+    # a "credentials" type). The only path is to bake the encrypted blob
+    # into each workflow's Credentials Configuration node settings.xml,
+    # which scripts/bake_knime_password.py does using KNIME's own
+    # KnimeEncryption.encrypt() Java method. Run that once after install:
+    #
+    #     python scripts/bake_knime_password.py
+    #
+    # See ml/knime/SETUP.md.
 
     t0 = datetime.now()
     res = subprocess.run(cmd, capture_output=True, text=True)
