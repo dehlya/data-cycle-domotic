@@ -30,6 +30,18 @@ WORKERS     = 8
 BATCH_SIZE  = 2000
 LOG_EVERY   = 1     # log after every batch — keeps the user reassured during long runs
 
+# After a batch is successfully inserted into silver + watermarked, delete the
+# bronze JSON files. This frees disk immediately rather than waiting for the
+# scheduled cleanup_bronze.py retention pass. Set KEEP_BRONZE=1 to disable
+# (e.g. for debugging or if you want to keep raw files around for a while).
+DELETE_BRONZE_ON_SILVER = os.getenv("KEEP_BRONZE", "0") != "1"
+
+# When we delete a file from bronze, we also append its filename to this log.
+# bulk_to_bronze.py reads this log on every scan and skips files listed here,
+# so a later SMB rescan doesn't re-copy the same files we just cleaned up.
+PROCESSED_LOG = (BRONZE_ROOT.parent / "processed.log") if BRONZE_ROOT.is_absolute() \
+    else (Path(__file__).resolve().parent.parent.parent / BRONZE_ROOT.parent / "processed.log")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("flatten_sensors")
 
@@ -75,6 +87,34 @@ def mark_done(engine, filenames):
         raw.commit()
     finally:
         raw.close()
+
+
+def delete_bronze_files(paths: list[str], filenames: list[str]):
+    """Delete bronze files that just made it into silver, then append their
+    filenames to processed.log so future SMB rescans don't re-copy them.
+
+    Best-effort: never crashes the pipeline on a permission error or missing
+    file, just counts and warns.
+    """
+    if not paths:
+        return 0, 0
+    deleted = 0
+    failed = 0
+    for p in paths:
+        try:
+            Path(p).unlink(missing_ok=True)
+            deleted += 1
+        except Exception:
+            failed += 1
+    # Append filenames to processed.log
+    try:
+        PROCESSED_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with PROCESSED_LOG.open("a", encoding="utf-8") as f:
+            for name in filenames:
+                f.write(name + "\n")
+    except Exception as e:
+        log.warning(f"Could not append to {PROCESSED_LOG}: {e}")
+    return deleted, failed
 
 # -- SENSOR PARSING ------------------------------------------------------------
 
@@ -169,7 +209,8 @@ def flatten(apt, payload, ts):
 def process_batch(args):
     paths_and_apt, db_url = args
     all_rows = []
-    processed = []
+    processed = []        # filenames (for watermark)
+    processed_paths = []  # full paths (for optional deletion)
     errors = 0
     for path_str, apt in paths_and_apt:
         try:
@@ -178,9 +219,15 @@ def process_batch(args):
             ts = parse_timestamp(payload.get("datetime", ""))
             all_rows.extend(flatten(apt, payload, ts))
             processed.append(Path(path_str).name)
+            processed_paths.append(path_str)
         except Exception:
             errors += 1
-    return {"rows": all_rows, "processed": processed, "errors": errors}
+    return {
+        "rows": all_rows,
+        "processed": processed,
+        "processed_paths": processed_paths,
+        "errors": errors,
+    }
 
 
 _TEMP_DDL = """
@@ -273,11 +320,20 @@ def count_bronze_files(apt):
 
 def find_new_files_fast(engine, watermark_set):
     """
-    For each apartment, walk Bronze folders from newest to oldest.
-    Stop scanning an apartment once we hit a streak of files that
-    are all in the watermark (meaning everything older is too).
+    For each apartment, scan ALL bronze JSON files and pick the ones not in
+    the watermark.
+
+    Note: the previous version had a "stop after 50 consecutive watermarked
+    files" optimization that was UNSAFE because the parallel ProcessPool +
+    as_completed in run() can mark batches done out of order. After an
+    interrupted backfill, the watermark contains a random subset of files
+    (often the newest few thousand finish first), so the optimization
+    triggered on the newest folders and falsely concluded "up to date" while
+    leaving most of the work undone.
+
+    A full scan over ~200k files takes 1-3 seconds — cheap insurance against
+    silent data loss.
     """
-    STOP_AFTER = 50  # consecutive watermarked files before we stop
     all_tasks = []
 
     for apt in APARTMENTS:
@@ -286,33 +342,20 @@ def find_new_files_fast(engine, watermark_set):
             log.warning(f"Bronze folder not found: {apt_root}")
             continue
 
-        # Get all year/month/day/hour folders sorted descending (newest first)
-        hour_folders = sorted(apt_root.glob("*/*/*/*"), reverse=True)
-        consecutive_existing = 0
         apt_new = 0
-
-        for folder in hour_folders:
-            if not folder.is_dir():
-                continue
-
-            files = sorted(folder.glob("*.json"), reverse=True)
-            for f in files:
-                if f.name in watermark_set:
-                    consecutive_existing += 1
-                    if consecutive_existing >= STOP_AFTER:
-                        break
-                else:
-                    consecutive_existing = 0
-                    all_tasks.append((str(f), apt))
-                    apt_new += 1
-
-            if consecutive_existing >= STOP_AFTER:
-                break
+        apt_total = 0
+        # Walk ALL year/month/day/hour folders, no early stop.
+        for f in apt_root.rglob("*.json"):
+            apt_total += 1
+            if f.name not in watermark_set:
+                all_tasks.append((str(f), apt))
+                apt_new += 1
 
         if apt_new > 0:
-            log.info(f"[{apt}] {apt_new:,} new files to process")
+            log.info(f"[{apt}] {apt_new:,} new files to process  "
+                     f"({apt_total:,} total in bronze)")
         else:
-            log.info(f"[{apt}] up to date")
+            log.info(f"[{apt}] up to date  ({apt_total:,} total in bronze)")
 
     return all_tasks
 
@@ -350,6 +393,7 @@ def run():
     log.info(f"Starting... first progress line will appear after the first batch finishes (~10-30s).")
 
     total_files = total_rows = total_errors = 0
+    total_deleted = 0
     t_start = time.monotonic()
 
     with ProcessPoolExecutor(max_workers=WORKERS) as executor:
@@ -361,6 +405,12 @@ def run():
             total_files  += len(result["processed"])
             total_rows   += len(result["rows"])
             total_errors += result["errors"]
+            # Aggressive cleanup: delete bronze files now that silver has them
+            if DELETE_BRONZE_ON_SILVER:
+                deleted, failed = delete_bronze_files(
+                    result["processed_paths"], result["processed"]
+                )
+                total_deleted += deleted
 
             if n % LOG_EVERY == 0 or n == len(batches):
                 elapsed   = time.monotonic() - t_start

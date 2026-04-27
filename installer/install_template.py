@@ -1054,13 +1054,21 @@ Flags:
         print(f"     .venv/bin/python ingestion/fast_flow/watcher.py")
     print()
 
-    print(f"  {DIM}3.{RESET} {BOLD}Run ML predictions in KNIME (headless, no GUI):{RESET}")
+    print(f"  {DIM}3.{RESET} {BOLD}Open the admin dashboard (recommended):{RESET}")
+    if os.name == "nt":
+        print(f"     {install_path}\\scripts\\admin.bat")
+    else:
+        print(f"     cd {install_path} && .venv/bin/streamlit run scripts/admin.py")
+    print(f"     {DIM}One-click pipeline status, manual triggers, log viewer.{RESET}")
+    print(f"     {DIM}Opens at http://localhost:8501 in your browser.{RESET}")
+    print()
+
+    print(f"  {DIM}4.{RESET} {BOLD}(Optional) Run ML predictions in KNIME (headless):{RESET}")
     if os.name == "nt":
         print(f"     .venv\\Scripts\\python.exe scripts\\run_knime_predictions.py")
     else:
         print(f"     .venv/bin/python scripts/run_knime_predictions.py")
-    print(f"     {DIM}(Reads .env, injects DB credentials at runtime — no manual setup{RESET}")
-    print(f"     {DIM} needed. Predictions land in gold.fact_prediction_*.){RESET}")
+    print(f"     {DIM}(or use the 'Run KNIME predictions' button in the admin dashboard){RESET}")
     print()
 
     write_log()
