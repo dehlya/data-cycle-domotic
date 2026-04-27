@@ -34,6 +34,7 @@ Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -102,6 +103,33 @@ def parse_db_credentials():
     return unquote(p.username or ""), unquote(p.password or "")
 
 
+# ── CREDENTIAL NODE DISCOVERY ─────────────────────────────────────────────────
+def find_credential_config_nodes(workflow_dir: Path) -> list[tuple[str, str]]:
+    """
+    Find every Credentials Configuration node inside a workflow folder.
+    Returns list of (node_id, parameter_name) tuples.
+
+    Reads the parameter-name from each node's settings.xml.
+    """
+    found = []
+    for d in workflow_dir.rglob("Credentials Configuration*"):
+        if not d.is_dir():
+            continue
+        m = re.search(r"\(#(\d+)\)", d.name)
+        if not m:
+            continue
+        node_id = m.group(1)
+        settings = d / "settings.xml"
+        if not settings.exists():
+            continue
+        content = settings.read_text(encoding="utf-8", errors="ignore")
+        # Find <entry key="parameter-name" type="xstring" value="..."/>
+        m2 = re.search(r'<entry key="parameter-name" type="xstring" value="([^"]+)"', content)
+        param_name = m2.group(1) if m2 else "credentials"
+        found.append((node_id, param_name))
+    return found
+
+
 # ── BATCH RUNNER ──────────────────────────────────────────────────────────────
 def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password: str) -> bool:
     """Run one workflow in batch mode. Returns True on exit code 0."""
@@ -121,16 +149,19 @@ def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password:
         "-application", "org.knime.product.KNIME_BATCH_APPLICATION",
         "-workflowDir=" + str(workflow_dir),
     ]
-    # We do NOT inject the password from Python. KNIME forbids overwriting
-    # password fields via flow variables OR via the -credential flag when
-    # the target is a Credentials Configuration node (it uses the same
-    # protected mechanism). The password is baked into each workflow's
-    # Credentials Configuration node ("weakly encrypted" = portable across
-    # machines using KNIME's fixed cipher key). See ml/knime/SETUP.md.
-    #
-    # If the .env DB password ever changes, the user must update the
-    # password in the Credentials Configuration node via the KNIME GUI
-    # once and re-export the .knwf.
+    # Inject DB credentials into every Credentials Configuration node via
+    # the -option=<NODE_ID>,<PARAM_NAME>,<USERNAME>,<PASSWORD> flag.
+    # This is the documented KNIME batch syntax for Credentials Configuration
+    # nodes specifically (different from -credential which targets Workflow
+    # Credentials, and from -workflow.variable which KNIME blocks for passwords).
+    if db_user and db_password:
+        cred_nodes = find_credential_config_nodes(workflow_dir)
+        if cred_nodes:
+            for node_id, param_name in cred_nodes:
+                cmd.append(f"-option={node_id},{param_name},{db_user},{db_password}")
+                print(f"  {DIM}injecting credential into node #{node_id} (param={param_name}){RESET}")
+        else:
+            warn("  No Credentials Configuration node found; relying on baked-in password")
 
     t0 = datetime.now()
     res = subprocess.run(cmd, capture_output=True, text=True)
