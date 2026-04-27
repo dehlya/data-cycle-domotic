@@ -38,6 +38,7 @@ import re
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -104,12 +105,44 @@ def parse_db_credentials():
 
 
 # ── CREDENTIAL NODE DISCOVERY ─────────────────────────────────────────────────
+def _find_model_param_name(settings_xml: Path) -> str | None:
+    """
+    Extract the user-set Parameter/Variable Name from a Credentials
+    Configuration node's settings.xml.
+
+    The XML has multiple <entry key="parameter-name" .../> elements at
+    different config nesting levels. The one we want lives directly under
+    <config key="model"> (NOT inside nested configs like credentialsValue).
+    Parse the XML and pick that exact one.
+    """
+    try:
+        tree = ET.parse(settings_xml)
+    except Exception:
+        return None
+    root = tree.getroot()
+    # Strip namespace for simple matching
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+    # Find <config key="model"> child of root
+    for cfg in root.findall(f"{ns}config"):
+        if cfg.attrib.get("key") == "model":
+            # Look ONLY at direct children (don't recurse into nested configs)
+            for entry in cfg.findall(f"{ns}entry"):
+                if entry.attrib.get("key") == "parameter-name":
+                    val = entry.attrib.get("value")
+                    if val:
+                        return val
+            break
+    return None
+
+
 def find_credential_config_nodes(workflow_dir: Path) -> list[tuple[str, str]]:
     """
     Find every Credentials Configuration node inside a workflow folder.
     Returns list of (node_id, parameter_name) tuples.
 
-    Reads the parameter-name from each node's settings.xml.
+    Reads the model-level parameter-name from each node's settings.xml.
     """
     found = []
     for d in workflow_dir.rglob("Credentials Configuration*"):
@@ -122,10 +155,7 @@ def find_credential_config_nodes(workflow_dir: Path) -> list[tuple[str, str]]:
         settings = d / "settings.xml"
         if not settings.exists():
             continue
-        content = settings.read_text(encoding="utf-8", errors="ignore")
-        # Find <entry key="parameter-name" type="xstring" value="..."/>
-        m2 = re.search(r'<entry key="parameter-name" type="xstring" value="([^"]+)"', content)
-        param_name = m2.group(1) if m2 else "credentials"
+        param_name = _find_model_param_name(settings) or "credentials"
         found.append((node_id, param_name))
     return found
 
@@ -149,17 +179,18 @@ def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password:
         "-application", "org.knime.product.KNIME_BATCH_APPLICATION",
         "-workflowDir=" + str(workflow_dir),
     ]
-    # No runtime password injection.
-    # KNIME blocks all CLI mechanisms for setting Credentials Configuration
-    # passwords (flow variables, -credential flag, -option flag — none accept
-    # a "credentials" type). The only path is to bake the encrypted blob
-    # into each workflow's Credentials Configuration node settings.xml,
-    # which scripts/bake_knime_password.py does using KNIME's own
-    # KnimeEncryption.encrypt() Java method. Run that once after install:
-    #
-    #     python scripts/bake_knime_password.py
-    #
-    # See ml/knime/SETUP.md.
+    # Inject DB credentials into every Credentials Configuration node via
+    # the -option=<NODE_ID>,<PARAM_NAME>,<VALUE>,<TYPE> flag.
+    # For credentials, VALUE is "user;password" and TYPE is "credentials".
+    if db_user and db_password:
+        cred_nodes = find_credential_config_nodes(workflow_dir)
+        if cred_nodes:
+            for node_id, param_name in cred_nodes:
+                value = f"{db_user};{db_password}"
+                cmd.append(f"-option={node_id},{param_name},{value},credentials")
+                print(f"  {DIM}injecting credential into node #{node_id} (param={param_name}){RESET}")
+        else:
+            warn("  No Credentials Configuration node found in workflow")
 
     t0 = datetime.now()
     res = subprocess.run(cmd, capture_output=True, text=True)
