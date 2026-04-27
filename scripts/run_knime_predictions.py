@@ -127,9 +127,11 @@ def _find_model_param_name(settings_xml: Path) -> str | None:
     # Find <config key="model"> child of root
     for cfg in root.findall(f"{ns}config"):
         if cfg.attrib.get("key") == "model":
-            # Look ONLY at direct children (don't recurse into nested configs)
+            # Look ONLY at direct children (don't recurse into nested configs).
+            # KNIME 5.x uses 'parameterName' (camelCase); older versions used
+            # 'parameter-name' (kebab). Accept both.
             for entry in cfg.findall(f"{ns}entry"):
-                if entry.attrib.get("key") == "parameter-name":
+                if entry.attrib.get("key") in ("parameterName", "parameter-name"):
                     val = entry.attrib.get("value")
                     if val:
                         return val
