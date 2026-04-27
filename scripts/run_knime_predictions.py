@@ -121,13 +121,16 @@ def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password:
         "-application", "org.knime.product.KNIME_BATCH_APPLICATION",
         "-workflowDir=" + str(workflow_dir),
     ]
-    # Inject DB credentials via the -credential flag, which targets the
-    # workflow's Workflow Credentials entry named 'db'. KNIME allows this
-    # but explicitly forbids overwriting password fields via flow variables,
-    # which is why we don't use -workflow.variable for the password.
-    # See ml/knime/SETUP.md.
-    if db_user and db_password:
-        cmd.append(f"-credential=db;{db_user};{db_password}")
+    # We do NOT inject the password from Python. KNIME forbids overwriting
+    # password fields via flow variables OR via the -credential flag when
+    # the target is a Credentials Configuration node (it uses the same
+    # protected mechanism). The password is baked into each workflow's
+    # Credentials Configuration node ("weakly encrypted" = portable across
+    # machines using KNIME's fixed cipher key). See ml/knime/SETUP.md.
+    #
+    # If the .env DB password ever changes, the user must update the
+    # password in the Credentials Configuration node via the KNIME GUI
+    # once and re-export the .knwf.
 
     t0 = datetime.now()
     res = subprocess.run(cmd, capture_output=True, text=True)
