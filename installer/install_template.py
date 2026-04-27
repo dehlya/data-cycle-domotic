@@ -900,6 +900,36 @@ def maybe_start_watcher(venv: Path, install_dir: Path):
         print(f"\n{DIM}Watcher stopped.{RESET}")
 
 
+def maybe_launch_admin(venv: Path, install_dir: Path):
+    """Final touch: offer to open the Streamlit admin dashboard in the browser."""
+    if not sys.stdin.isatty():
+        return
+    admin = install_dir / "scripts" / "admin.py"
+    if not admin.exists():
+        return
+    print()
+    print(f"  {DIM}The admin dashboard is a single browser page that shows pipeline{RESET}")
+    print(f"  {DIM}status, lets you trigger ETL/KNIME/PBI from buttons, and tails logs.{RESET}")
+    if not ask_yes_no("Launch the admin dashboard now?", default=True):
+        if os.name == "nt":
+            print(f"  {DIM}Later: double-click {install_dir}\\scripts\\admin.bat{RESET}")
+        else:
+            print(f"  {DIM}Later: streamlit run scripts/admin.py{RESET}")
+        return
+    py = venv_python(venv)
+    print(f"{DIM}Opening http://localhost:8501 in your browser... (Ctrl+C to stop){RESET}\n")
+    try:
+        subprocess.run(
+            [str(py), "-m", "streamlit", "run", str(admin)],
+            cwd=str(install_dir),
+        )
+    except KeyboardInterrupt:
+        print(f"\n{DIM}Admin dashboard stopped.{RESET}")
+    except FileNotFoundError:
+        warn("streamlit not in venv (skipped during --skip-deps?). "
+             f"Install with: {venv}/Scripts/pip install streamlit")
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1096,10 +1126,11 @@ Flags:
     print(f"{DIM}Install log saved to install.log{RESET}")
     print()
 
-    # Interactive: auto-open Power BI + KNIME + start watcher
+    # Interactive: auto-open Power BI + KNIME + start watcher + admin dashboard
     maybe_open_powerbi(install_path)
     maybe_run_predictions(venv, install_path)
     maybe_start_watcher(venv, install_path)
+    maybe_launch_admin(venv, install_path)
 
 
 if __name__ == "__main__":
