@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+from psycopg2 import extras as _pg_extras
 from sqlalchemy import create_engine, text
 
 load_dotenv()
@@ -56,11 +57,22 @@ def watermark_count(engine):
 
 
 def mark_done(engine, filenames):
-    with engine.begin() as conn:
-        conn.execute(
-            text("INSERT INTO silver.etl_watermark (filename) VALUES (:f) ON CONFLICT DO NOTHING"),
-            [{"f": f} for f in filenames]
+    """Bulk-mark filenames as processed. Uses psycopg2.execute_values for
+    ~10-30x speedup over SQLAlchemy executemany."""
+    if not filenames:
+        return
+    raw = engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        _pg_extras.execute_values(
+            cur,
+            "INSERT INTO silver.etl_watermark (filename) VALUES %s ON CONFLICT DO NOTHING",
+            [(f,) for f in filenames],
+            page_size=5000,
         )
+        raw.commit()
+    finally:
+        raw.close()
 
 # -- SENSOR PARSING ------------------------------------------------------------
 
@@ -169,17 +181,35 @@ def process_batch(args):
     return {"rows": all_rows, "processed": processed, "errors": errors}
 
 
-UPSERT_SQL = text("""
-    INSERT INTO silver.sensor_events (apartment, room, sensor_type, field, value, unit, timestamp, is_outlier)
-    VALUES (:apartment, :room, :sensor_type, :field, :value, :unit, :timestamp, :is_outlier)
+_UPSERT_SQL = """
+    INSERT INTO silver.sensor_events
+        (apartment, room, sensor_type, field, value, unit, timestamp, is_outlier)
+    VALUES %s
     ON CONFLICT (apartment, room, sensor_type, field, timestamp)
-    DO UPDATE SET value=EXCLUDED.value, unit=EXCLUDED.unit, is_outlier=EXCLUDED.is_outlier
-""")
+    DO UPDATE SET value = EXCLUDED.value,
+                  unit = EXCLUDED.unit,
+                  is_outlier = EXCLUDED.is_outlier
+"""
 
 def upsert(engine, rows):
-    if rows:
-        with engine.begin() as conn:
-            conn.execute(UPSERT_SQL, rows)
+    """Bulk-upsert sensor events. Uses psycopg2.execute_values which
+    expands a SINGLE INSERT ... VALUES (...), (...), (...) statement —
+    typically 10-30x faster than per-row INSERT for this workload."""
+    if not rows:
+        return
+    # Convert dict rows to tuples in column order (one allocation, fast)
+    values = [
+        (r["apartment"], r["room"], r["sensor_type"], r["field"],
+         r["value"], r["unit"], r["timestamp"], r["is_outlier"])
+        for r in rows
+    ]
+    raw = engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        _pg_extras.execute_values(cur, _UPSERT_SQL, values, page_size=5000)
+        raw.commit()
+    finally:
+        raw.close()
 
 
 # -- FIND NEW FILES (FAST) -----------------------------------------------------
