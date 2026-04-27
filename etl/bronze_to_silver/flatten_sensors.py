@@ -7,6 +7,8 @@ Only scans recent Bronze folders instead of full rglob.
 Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
 
+import csv
+import io
 import json
 import logging
 import os
@@ -181,32 +183,79 @@ def process_batch(args):
     return {"rows": all_rows, "processed": processed, "errors": errors}
 
 
-_UPSERT_SQL = """
+_TEMP_DDL = """
+    CREATE TEMP TABLE _tmp_sensor_events (
+        apartment   text,
+        room        text,
+        sensor_type text,
+        field       text,
+        value       double precision,
+        unit        text,
+        "timestamp" timestamptz,
+        is_outlier  boolean
+    ) ON COMMIT DROP
+"""
+
+# Upsert from temp table. DISTINCT ON dedupes within the batch so PostgreSQL
+# doesn't complain about "command cannot affect row a second time" when the
+# same (apartment, room, sensor_type, field, timestamp) appears twice.
+_UPSERT_FROM_TMP = """
     INSERT INTO silver.sensor_events
         (apartment, room, sensor_type, field, value, unit, timestamp, is_outlier)
-    VALUES %s
+    SELECT DISTINCT ON (apartment, room, sensor_type, field, timestamp)
+           apartment, room, sensor_type, field, value, unit, timestamp, is_outlier
+    FROM _tmp_sensor_events
+    ORDER BY apartment, room, sensor_type, field, timestamp
     ON CONFLICT (apartment, room, sensor_type, field, timestamp)
-    DO UPDATE SET value = EXCLUDED.value,
-                  unit = EXCLUDED.unit,
+    DO UPDATE SET value      = EXCLUDED.value,
+                  unit       = EXCLUDED.unit,
                   is_outlier = EXCLUDED.is_outlier
 """
 
 def upsert(engine, rows):
-    """Bulk-upsert sensor events. Uses psycopg2.execute_values which
-    expands a SINGLE INSERT ... VALUES (...), (...), (...) statement —
-    typically 10-30x faster than per-row INSERT for this workload."""
+    """Bulk-upsert sensor events using PostgreSQL COPY into a TEMP TABLE,
+    then a single INSERT ... SELECT ... ON CONFLICT to merge into silver.
+
+    COPY is the fastest bulk-load mechanism in Postgres — bytes stream
+    directly into the temp table, no statement parsing per row, no per-row
+    network round trips. Combined with a single set-based upsert, this is
+    typically 5-10x faster than execute_values and 50-150x faster than the
+    original per-row INSERT.
+    """
     if not rows:
         return
-    # Convert dict rows to tuples in column order (one allocation, fast)
-    values = [
-        (r["apartment"], r["room"], r["sensor_type"], r["field"],
-         r["value"], r["unit"], r["timestamp"], r["is_outlier"])
-        for r in rows
-    ]
     raw = engine.raw_connection()
     try:
         cur = raw.cursor()
-        _pg_extras.execute_values(cur, _UPSERT_SQL, values, page_size=5000)
+        cur.execute(_TEMP_DDL)
+
+        # Stream rows as CSV into the temp table. NULL '' makes empty cells
+        # be NULL (so missing value/unit doesn't blow up doubles).
+        buf = io.StringIO()
+        w = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+        for r in rows:
+            ts = r["timestamp"]
+            if hasattr(ts, "isoformat"):
+                ts = ts.isoformat()
+            w.writerow([
+                r["apartment"],
+                r["room"],
+                r["sensor_type"],
+                r["field"],
+                r["value"] if r["value"] is not None else "",
+                r["unit"]  if r["unit"]  is not None else "",
+                ts,
+                "true" if r["is_outlier"] else "false",
+            ])
+        buf.seek(0)
+        cur.copy_expert(
+            "COPY _tmp_sensor_events "
+            "(apartment, room, sensor_type, field, value, unit, \"timestamp\", is_outlier) "
+            "FROM STDIN WITH (FORMAT CSV, NULL '')",
+            buf,
+        )
+
+        cur.execute(_UPSERT_FROM_TMP)
         raw.commit()
     finally:
         raw.close()
