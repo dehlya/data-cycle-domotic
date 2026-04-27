@@ -851,16 +851,37 @@ def verify_data(venv: Path, db_url: str):
     if rc != 0:
         warn(f"Verification query failed: {err or out}")
         return
+
+    # Track which tables are ready vs empty so we can give a clear summary.
+    counts: dict[str, int | str] = {}
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) == 2:
             t, n = parts
             if n.startswith("ERR"):
                 fail(f"  gold.{t} — {n}")
+                counts[t] = "ERR"
             elif int(n) == 0:
                 warn(f"  gold.{t} — empty")
+                counts[t] = 0
             else:
                 ok(f"  gold.{t} — {int(n):,} rows")
+                counts[t] = int(n)
+
+    # Final readiness summary — explicit so the user knows whether to celebrate.
+    print()
+    needs_attention = [
+        t for t, n in counts.items()
+        if (n == "ERR") or (n == 0 and t in (
+            "fact_environment_minute", "fact_energy_minute", "fact_presence_minute"
+        ))
+    ]
+    if not needs_attention:
+        ok(f"{BOLD}All core tables populated — your install is ready to use.{RESET}")
+    else:
+        warn(f"Some core tables look empty: {', '.join(needs_attention)}")
+        warn("  This usually means SMB backfill was skipped or failed. "
+             "You can re-run later with: python ingestion/fast_flow/watcher.py --scan")
 
 
 def maybe_start_watcher(venv: Path, install_dir: Path):
