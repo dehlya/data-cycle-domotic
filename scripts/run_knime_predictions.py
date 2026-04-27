@@ -150,15 +150,17 @@ def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password:
         "-workflowDir=" + str(workflow_dir),
     ]
     # Inject DB credentials into every Credentials Configuration node via
-    # the -option=<NODE_ID>,<PARAM_NAME>,<USERNAME>,<PASSWORD> flag.
-    # This is the documented KNIME batch syntax for Credentials Configuration
-    # nodes specifically (different from -credential which targets Workflow
-    # Credentials, and from -workflow.variable which KNIME blocks for passwords).
+    # the -option=<NODE_ID>,<PARAM_NAME>,<VALUE>,<TYPE> flag.
+    # For credentials, VALUE is "user;password" and TYPE is "credentials".
+    # Documented KNIME batch syntax for Credentials Configuration nodes
+    # (different from -credential which targets Workflow Credentials, and
+    # from -workflow.variable which KNIME blocks for passwords).
     if db_user and db_password:
         cred_nodes = find_credential_config_nodes(workflow_dir)
         if cred_nodes:
             for node_id, param_name in cred_nodes:
-                cmd.append(f"-option={node_id},{param_name},{db_user},{db_password}")
+                value = f"{db_user};{db_password}"
+                cmd.append(f"-option={node_id},{param_name},{value},credentials")
                 print(f"  {DIM}injecting credential into node #{node_id} (param={param_name}){RESET}")
         else:
             warn("  No Credentials Configuration node found; relying on baked-in password")
