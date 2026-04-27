@@ -24,7 +24,7 @@ Gold             OLAP/DWH — aggregated KPIs, fact tables
     ↓
 ML               Energy & presence forecasting — Python · KNIME
     ↓
-BI               Power BI (energy, environment) · SAP SAC (presence)
+BI               Power BI dashboards · Streamlit admin pane
 ```
 
 ---
@@ -65,8 +65,16 @@ docs/           architecture diagrams · technical decisions (ADRs)
 **For a guided install** (recommended): visit the project website's `/install` page,
 fill in your credentials, download the generated installer, and run it. The installer
 clones the repo, creates the Python venv, installs dependencies, creates the
-PostgreSQL database + app user, runs the initial ETL, and offers to open Power BI
-and start the watcher.
+PostgreSQL database + app user, runs the initial ETL, configures KNIME workflows
+for runtime credential injection, and (optionally) registers the watcher to
+auto-start on every login.
+
+After install, open the **admin dashboard** for one-click pipeline control:
+```bash
+scripts/admin.bat       # Windows: double-click
+streamlit run scripts/admin.py    # other platforms
+```
+Then visit `http://localhost:8501`.
 
 **For manual setup**:
 ```bash
