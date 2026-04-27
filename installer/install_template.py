@@ -763,6 +763,75 @@ def maybe_run_predictions(venv: Path, install_dir: Path):
         warn(f"  (or open the workflow once in KNIME and check the PostgreSQL Connector setup)")
 
 
+def maybe_register_autostart(venv: Path, install_dir: Path):
+    """Optionally register the watcher to auto-start on every login.
+
+    Asks the user explicitly (default Yes for dummy-friendliness). Creates a
+    .lnk in the user's Startup folder pointing at:
+        <venv>/python.exe  ingestion/fast_flow/watcher.py
+
+    No admin rights needed, no Task Scheduler, no Windows service. Easy to
+    undo later by deleting the .lnk from shell:startup.
+    """
+    if os.name != "nt":
+        return  # only Windows for now (Sacha's VM target)
+    if not sys.stdin.isatty():
+        warn("Non-interactive: skipping autostart registration "
+             "(re-run installer interactively to enable)")
+        return
+
+    print()
+    print(f"  {DIM}The watcher runs continuously: every minute it pulls new sensor{RESET}")
+    print(f"  {DIM}files, every 15 min it refreshes gold facts, and once a day{RESET}")
+    print(f"  {DIM}(06:30) it downloads weather + runs ML predictions.{RESET}")
+    print(f"  {DIM}Auto-starting it on login means you literally never touch it.{RESET}")
+    print()
+    if not ask_yes_no("Auto-start the watcher every time you log in?", default=True):
+        warn("Skipped. Run manually anytime: "
+             f"{DIM}python ingestion/fast_flow/watcher.py{RESET}")
+        return
+
+    pyw = venv / "Scripts" / "pythonw.exe"   # pythonw = no console window
+    py  = venv / "Scripts" / "python.exe"
+    target = pyw if pyw.exists() else py
+    if not target.exists():
+        fail(f"venv python not found at {target}; cannot register autostart")
+        return
+
+    watcher = install_dir / "ingestion" / "fast_flow" / "watcher.py"
+    if not watcher.exists():
+        fail(f"watcher.py not found at {watcher}")
+        return
+
+    startup_dir = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    shortcut    = startup_dir / "DataCycle Watcher.lnk"
+
+    # PowerShell one-liner to create the .lnk via the WScript.Shell COM object.
+    # Single-quote the PS string so $ stays literal; escape inner single quotes.
+    ps_script = (
+        f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{shortcut}'); "
+        f"$s.TargetPath = '{target}'; "
+        f"$s.Arguments = '\"{watcher}\"'; "
+        f"$s.WorkingDirectory = '{install_dir}'; "
+        f"$s.IconLocation = '{target}'; "
+        f"$s.Description = 'DataCycle pipeline watcher (sensors + weather + ML)'; "
+        f"$s.Save()"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0 and shortcut.exists():
+            ok(f"Auto-start enabled: {shortcut}")
+            print(f"  {DIM}To disable: delete the .lnk from shell:startup{RESET}")
+        else:
+            fail(f"Could not create startup shortcut: "
+                 f"{(result.stderr or result.stdout).strip()[:200]}")
+    except Exception as e:
+        fail(f"Could not create startup shortcut: {e}")
+
+
 def verify_data(venv: Path, db_url: str):
     """Quick sanity check: count rows in key gold tables."""
     host, port, user, password, dbname = parse_db_url(db_url)
@@ -852,7 +921,7 @@ Flags:
         print(f"Skipping: {YELLOW}{skipped}{RESET}")
 
     # ── 1. Prerequisites ────────────────────────────────────────────────────
-    step(1, 9, "Checking prerequisites")
+    step(1, 10, "Checking prerequisites")
     check_python()
     check_cmd("git", "Install Git from https://git-scm.com/downloads")
     # Optional tools — warn but don't die
@@ -873,15 +942,15 @@ Flags:
         warn("  Install from https://www.knime.com/downloads")
 
     # ── 2. Clone repo ──────────────────────────────────────────────────────
-    step(2, 9, "Cloning repository")
+    step(2, 10, "Cloning repository")
     clone_repo(install_path)
 
     # ── 3. Write .env ──────────────────────────────────────────────────────
-    step(3, 9, "Writing .env configuration")
+    step(3, 10, "Writing .env configuration")
     write_env(install_path)
 
     # ── 4. Create venv + deps ──────────────────────────────────────────────
-    step(4, 9, "Setting up Python environment")
+    step(4, 10, "Setting up Python environment")
     venv = create_venv(install_path)
     if SKIP_DEPS:
         warn("--skip-deps set, leaving venv as-is")
@@ -889,7 +958,7 @@ Flags:
         install_deps(venv, install_path)
 
     # ── 5. Pre-flight connectivity checks ─────────────────────────────────
-    step(5, 9, "Pre-flight connectivity checks")
+    step(5, 10, "Pre-flight connectivity checks")
     mount_smb_share()  # best-effort, warns on failure
 
 
@@ -915,7 +984,7 @@ Flags:
                       sftp_pw.group(1).strip() if sftp_pw else "")
 
     # ── 6. Create app user + DB, then schemas ──────────────────────────────
-    step(6, 9, "Creating PostgreSQL user, database + schemas")
+    step(6, 10, "Creating PostgreSQL user, database + schemas")
     if not ensure_db_and_user(venv):
         die("DB + user setup failed. Check admin credentials.")
     if db_url and not validate_postgres_app(venv, db_url):
@@ -926,7 +995,7 @@ Flags:
         warn(f"Schema creation had issues: {e}")
 
     # ── 7. Bootstrap silver (MySQL dims + optional full backfill) ──────────
-    step(7, 9, "Bootstrapping silver layer")
+    step(7, 10, "Bootstrapping silver layer")
     if SKIP_MYSQL:
         warn("--skip-mysql set, skipping MySQL dim import")
     else:
@@ -934,7 +1003,7 @@ Flags:
     backfill_bronze_silver(venv, install_path)
 
     # ── 8. Initial gold ETL ────────────────────────────────────────────────
-    step(8, 9, "Running initial gold ETL")
+    step(8, 10, "Running initial gold ETL")
     if SKIP_ETL:
         warn("--skip-etl set, skipping populate_gold (run manually with: python -m etl.silver_to_gold.populate_gold)")
     else:
@@ -945,10 +1014,14 @@ Flags:
             warn("You can re-run manually: python -m etl.silver_to_gold.populate_gold")
 
     # ── 9. Verify + auto-config BI/KNIME ──────────────────────────────────
-    step(9, 9, "Verifying + configuring BI/KNIME")
+    step(9, 10, "Verifying + configuring BI/KNIME")
     if db_url:
         verify_data(venv, db_url)
     configure_bi_knime(venv, install_path)
+
+    # ── 10. Optional: register watcher to auto-start on login ─────────────
+    step(10, 10, "Auto-start watcher on login (optional)")
+    maybe_register_autostart(venv, install_path)
 
     # ── Done ───────────────────────────────────────────────────────────────
     print()
