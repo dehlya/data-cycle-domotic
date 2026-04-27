@@ -181,18 +181,19 @@ def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password:
         "-application", "org.knime.product.KNIME_BATCH_APPLICATION",
         "-workflowDir=" + str(workflow_dir),
     ]
-    # Inject DB credentials into every Credentials Configuration node via
-    # the -option=<NODE_ID>,<PARAM_NAME>,<VALUE>,<TYPE> flag.
-    # For credentials, VALUE is "user;password" and TYPE is "credentials".
-    if db_user and db_password:
-        cred_nodes = find_credential_config_nodes(workflow_dir)
-        if cred_nodes:
-            for node_id, param_name in cred_nodes:
-                value = f"{db_user};{db_password}"
-                cmd.append(f"-option={node_id},{param_name},{value},credentials")
-                print(f"  {DIM}injecting credential into node #{node_id} (param={param_name}){RESET}")
-        else:
-            warn("  No Credentials Configuration node found in workflow")
+    # NOTE: KNIME has no CLI mechanism for injecting credentials into
+    # Credentials Configuration nodes. We tried -credential (Workflow
+    # Credentials only), -workflow.variable (KNIME blocks password
+    # overrides), and -option (no 'credentials' type — only primitives).
+    # The only working path is to bake the encrypted password into the
+    # node's settings.xml using KNIME's own encryption code:
+    #
+    #     python scripts/bake_knime_password.py
+    #
+    # That script reads the password from .env and patches every
+    # Credentials Configuration node in both ~/knime-workspace/ and
+    # ml/knime/*.knwf. Run it once after install (or any time .env's
+    # DB password changes). See ml/knime/SETUP.md.
 
     t0 = datetime.now()
     res = subprocess.run(cmd, capture_output=True, text=True)
