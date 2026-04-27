@@ -25,7 +25,7 @@ DB_URL      = os.getenv("DB_URL")
 APARTMENTS  = ["jimmy", "jeremie"]
 WORKERS     = 8
 BATCH_SIZE  = 2000
-LOG_EVERY   = 10
+LOG_EVERY   = 1     # log after every batch — keeps the user reassured during long runs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("flatten_sensors")
@@ -267,7 +267,8 @@ def run():
         return
 
     batches = [all_tasks[i:i+BATCH_SIZE] for i in range(0, len(all_tasks), BATCH_SIZE)]
-    log.info(f"Batches: {len(batches)} x {BATCH_SIZE} files")
+    log.info(f"Batches: {len(batches)} x {BATCH_SIZE} files  ({WORKERS} parallel workers)")
+    log.info(f"Starting... first progress line will appear after the first batch finishes (~10-30s).")
 
     total_files = total_rows = total_errors = 0
     t_start = time.monotonic()
@@ -287,7 +288,13 @@ def run():
                 rate      = total_files / elapsed if elapsed > 0 else 1
                 remaining = (len(all_tasks) - total_files) / rate
                 pct       = total_files / len(all_tasks) * 100
-                print(f"  {GR}v{R} {total_files:>7,} files  {total_rows:>10,} rows  {pct:.1f}%  {D}~{remaining/60:.1f}min remaining{R}")
+                # Render a simple text progress bar so users see motion
+                bar_w = 24
+                filled = int(bar_w * pct / 100)
+                bar = "█" * filled + "░" * (bar_w - filled)
+                print(f"  [{bar}] batch {n:>3}/{len(batches)}  "
+                      f"{total_files:>7,} files  {total_rows:>10,} rows  "
+                      f"{pct:5.1f}%  {D}~{remaining/60:.1f}min left{R}")
 
     elapsed = time.monotonic() - t_start
     total_time = time.monotonic() - t0
