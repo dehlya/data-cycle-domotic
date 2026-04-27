@@ -1,122 +1,87 @@
-# KNIME workflow — one-time setup
+# KNIME workflow setup
 
-After cloning the repo (or running the installer), do this **once per
-workflow** so batch mode works automatically. Subsequent runs need no
-manual steps.
+The KNIME workflows ship pre-wired with a **Variable to Credentials**
+architecture that lets the runner inject DB credentials from `.env` at
+runtime without ever touching a password field directly. After install,
+no GUI steps are needed.
 
-## Why
+## How it works
 
-KNIME explicitly forbids overwriting password fields via either flow
-variables OR the `-credential` CLI flag when the target is a Credentials
-Configuration node (the error is `Attempt to overwrite the password
-with config key 'password' failed. It's not possible to overwrite
-passwords with flow variables.`).
-
-So the only path that works is: **bake the DB password into a
-Credentials Configuration node** inside each workflow, saved with KNIME's
-"weakly encrypted" cipher (which uses a fixed key, so the encrypted
-value is portable across machines as long as everyone uses the same DB
-password).
-
-## Steps (5 min per workflow)
-
-For both `Motion_Prediction_Server` and `Consumption_Weather_Prediction_Server`:
-
-1. **Open the workflow in KNIME Analytics Platform**
-   (KNIME Explorer → LOCAL → workflow name).
-
-2. **Drop a Credentials Configuration node onto the root canvas**
-   (Node Repository → search "Credentials Configuration" → drag onto
-   canvas, OUTSIDE any component / metanode).
-
-3. **Configure the node:**
-   - **Parameter / Variable Name:** `db`
-   - **Username:** your `.env` DB user (e.g. `domotic`)
-   - **Password:** your `.env` DB password (the real one)
-   - ✅ **Save password in configuration (weakly encrypted)** — REQUIRED
-   - ☐ Prompt user name in component dialog (uncheck)
-   - **Apply → OK**
-
-4. **Right-click the node → Execute** → wait for the green status dot.
-
-5. **Wire the red flow variable port** (top-right corner of the
-   Credentials Configuration node) **to BOTH PostgreSQL Connectors'**
-   red input ports (top-left of each).
-
-6. **For each PostgreSQL Connector** (there are 2 per workflow:
-   `(#1)` and `(#579)`):
-   1. Double-click → **Connection Settings** tab
-   2. Authentication section → **Credentials** radio
-   3. Dropdown → pick **`db`**
-   4. **Apply → OK**
-
-7. **Ctrl+S** to save the workflow.
-   The `*` next to the workflow name in the title bar should disappear.
-
-8. **File → Export KNIME Workflow** → overwrite the file in
-   `ml/knime/<workflow_name>.knwf`.
-
-## Verify
-
-After save, run from PowerShell:
-
-```powershell
-Get-ChildItem "$HOME\knime-workspace\<workflow>" -Directory | Where-Object { $_.Name -match "Credentials Configuration" }
-Select-String -Path "$HOME\knime-workspace\<workflow>\PostgreSQL Connector*\settings.xml" -Pattern 'key="credentials"'
+```
+.env DB_URL  ──>  scripts/run_knime_predictions.py
+                            │
+                            │  -workflow.variable=db_user,<user>,String
+                            │  -workflow.variable=db_pwd,<password>,String
+                            ▼
+   ┌──────────────────────────────────────────────┐
+   │   String Configuration  "db_user"            │
+   │   String Configuration  "db_pwd"             │
+   │             ↓ (flow variables)               │
+   │   Variable to Credentials  →  credential 'db'│
+   │             ↓ (flow variable port)           │
+   │   PostgreSQL Connector(s)  use 'db'          │
+   └──────────────────────────────────────────────┘
 ```
 
-Expected:
-- First command lists `Credentials Configuration (#XXX)`
-- Both PG Connectors show `value="db"` (NOT `isnull="true"`)
+KNIME blocks flow-variable overrides on `xpassword` fields for security.
+Plain `String` flow variables are unrestricted, and the **Variable to
+Credentials** node converts the two strings into a real credential object
+*before* it reaches any password-typed field — so KNIME's rule is never
+violated.
 
-## Test
+## What's already done in the shipped `.knwf` files
+
+For both `Motion_Prediction_Server.knwf` and
+`Consumption_Weather_Prediction_Server.knwf`:
+
+1. Two **String Configuration** nodes at root canvas:
+   - Parameter Name `db_user`, default `domotic`
+   - Parameter Name `db_pwd`, default `dummy_default` (overridden at runtime)
+2. One **Variable to Credentials** node, bound to `db_user` (username) and
+   `db_pwd` (password), output credential name `db`.
+3. Each PostgreSQL Connector has Authentication → Credentials → `db`,
+   wired via the flow variable port from Variable to Credentials.
+4. The `Flow Variables` tab on every PG Connector has `username`,
+   `password`, `selectedType`, `credentials` all UNBOUND. (Bindings on
+   that tab would trigger the password-overwrite restriction.)
+
+## Running
 
 ```bash
-python scripts/run_knime_predictions.py
+python scripts/run_knime_predictions.py            # both workflows
+python scripts/run_knime_predictions.py motion     # just motion
+python scripts/run_knime_predictions.py consumption# just consumption
 ```
 
-Should report:
-```
-Motion_Prediction_Server completed in 30s
-Consumption_Weather_Prediction_Server completed in 40s
-Total: 2 ok 0 failed
-```
+The runner reads `DB_URL` from `.env`, extracts the user + password,
+passes them as `-workflow.variable=...,String`, and KNIME does the rest.
 
-And the DB should have new rows:
-```sql
-SELECT model_name, target, COUNT(*) FROM gold.fact_prediction_motion       GROUP BY 1,2;
-SELECT model_name, target, COUNT(*) FROM gold.fact_prediction_consumption  GROUP BY 1,2;
-```
+## What if I edit a workflow?
 
-## What if my DB password changes?
+If you modify a `.knwf` in KNIME GUI and re-export it, **DO NOT delete**
+the String Configuration / Variable to Credentials wiring or the runner
+won't be able to inject credentials. Specifically keep:
 
-The encrypted password lives inside the `.knwf`. If `.env` `DB_URL`
-changes, you must:
+- The two String Configuration nodes named `db_user` and `db_pwd`
+  (parameter names must match those exact strings — that's what
+  `-workflow.variable` targets).
+- The Variable to Credentials node with output name `db`.
+- The flow variable port wires from those nodes to every PostgreSQL
+  Connector.
+- The PG Connector Authentication mode set to **Credentials** with
+  dropdown value `db`.
+- The PG Connector **Flow Variables tab** completely empty (no bindings).
 
-1. Open both workflows in KNIME GUI
-2. Edit the Credentials Configuration node → update the password →
-   Apply → OK → Ctrl+S → re-export `.knwf`
-3. Commit the new `.knwf` files
-
-Yes, this is mildly annoying. KNIME doesn't expose a CLI mechanism to
-update passwords because of the security rule above.
+Verify after edit by running the runner against the deployed workspace.
+If you see "Attempt to overwrite the password" → there's a password
+flow-var binding somewhere that needs clearing.
 
 ## Common gotchas
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Attempt to overwrite the password with config key 'password' failed` | Old runner code is still passing `-credential=db;...` | Pull latest `scripts/run_knime_predictions.py` |
-| `credentials="" isnull="true"` in PG Connector settings.xml | You picked `db` from dropdown but didn't Apply+OK before saving, OR Ctrl+S didn't fire | Re-open dialog, Apply → OK, then Ctrl+S, watch the title-bar `*` disappear |
-| Credentials Configuration folder doesn't appear in workspace | Node was added but workflow not saved | Click in canvas, Ctrl+S |
+| `Attempt to overwrite the password with config key 'password' failed` | A PG Connector's Flow Variables tab has `password` bound to a flow variable | Open PG Connector → Flow Variables tab → clear `password` (and `username` and `credentials`) bindings → Apply → OK |
+| `No credentials stored to name "C:\Users\...\knime-workspace"` | A PG Connector's `credentials` slot was bound to the built-in `knime.workspace` flow variable | Same fix as above — clear the binding on the Flow Variables tab |
+| `The workflow variables are potentially unused: "db_user" "db_pwd"` | The workflow doesn't have String Configuration nodes with those exact parameter names | Re-add the String Configuration nodes with parameter names `db_user` and `db_pwd` |
 | `Java exit code=4` immediately after launch | KNIME GUI is open with the same workspace | Close KNIME GUI before running batch (`Stop-Process -Name knime -Force`) |
-| `Please enter a valid password` warnings | Password field was left empty in the Credentials Configuration node | Re-open node config, fill password, ✅ "Save password (weakly encrypted)", Apply |
-| JVM crash in `libcef.dll` | Stale workspace state from interrupted GUI session | Close KNIME GUI, delete `~/knime-workspace/<workflow>/`, re-deploy with `python scripts/deploy_knime.py` |
-
-## For future-Sacha (keeping this clean)
-
-If you change the workflows further, please:
-1. Keep using the Credentials Configuration node with parameter name `db`
-2. Keep "Save password in configuration (weakly encrypted)" checked
-3. Re-export the `.knwf` so the repo always has the latest credential-aware
-   version
-4. Test with `python scripts/run_knime_predictions.py` before pushing
+| `Input table is empty` (and only that) | Source gold tables are empty / filter excluded all rows | Run the gold ETL first: `python -m etl.silver_to_gold.populate_gold` |

@@ -961,18 +961,13 @@ Flags:
         print(f"     .venv/bin/python ingestion/fast_flow/watcher.py")
     print()
 
-    print(f"  {DIM}3.{RESET} {BOLD}(Optional) Run ML predictions in KNIME:{RESET}")
-    print(f"     - Install KNIME Analytics Platform from https://www.knime.com/downloads")
-    print(f"     - File -> Import KNIME Workflow -> select each:")
-    print(f"         {install_path / 'ml' / 'knime' / 'Motion_Prediction_Server.knwf'}")
-    print(f"         {install_path / 'ml' / 'knime' / 'Consumption_Weather_Prediction_Server.knwf'}")
-    print(f"     - Double-click the {BOLD}PostgreSQL Connector{RESET} node and set:")
-    print(f"     {DIM}      Hostname = {PG_HOST}{RESET}")
-    print(f"     {DIM}      Port     = {PG_PORT}{RESET}")
-    print(f"     {DIM}      Database = {PG_DATABASE}{RESET}")
-    print(f"     {DIM}      User     = {PG_APP_USER}{RESET}")
-    print(f"     {DIM}      Password = (your app password){RESET}")
-    print(f"     - Run the workflow. Predictions land in gold.fact_prediction")
+    print(f"  {DIM}3.{RESET} {BOLD}Run ML predictions in KNIME (headless, no GUI):{RESET}")
+    if os.name == "nt":
+        print(f"     .venv\\Scripts\\python.exe scripts\\run_knime_predictions.py")
+    else:
+        print(f"     .venv/bin/python scripts/run_knime_predictions.py")
+    print(f"     {DIM}(Reads .env, injects DB credentials at runtime — no manual setup{RESET}")
+    print(f"     {DIM} needed. Predictions land in gold.fact_prediction_*.){RESET}")
     print()
 
     write_log()

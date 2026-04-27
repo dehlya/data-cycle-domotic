@@ -15,17 +15,22 @@ Requirements:
       configure_bi_knime step)
     - DB credentials in .env
 
-Notes on the password:
-    KNIME forbids overwriting password fields via flow variables for
-    security reasons ("It's not possible to overwrite passwords with flow
-    variables"). So we use **Workflow Credentials** instead:
-      1. Each workflow has a Workflow Credential named 'db' (created once
-         in KNIME GUI: right-click workflow -> Workflow Credentials -> Add
-         'db' with empty user/password). See ml/knime/SETUP.md.
-      2. Each PostgreSQL Connector is set to "Use credentials" -> 'db'.
-      3. We inject username + password at runtime via:
-            -credential=db;<user>;<password>
-         which IS allowed by KNIME for Workflow Credentials.
+How credentials are injected:
+    KNIME forbids overwriting password fields via flow variables. To
+    sidestep this, the workflows use a "Variable to Credentials" node
+    that reads two plain String flow variables (db_user, db_pwd) and
+    constructs a credential object named 'db'. The PostgreSQL Connectors
+    bind to that credential via Authentication -> Credentials -> 'db'.
+
+    At runtime we just pass:
+        -workflow.variable=db_user,<user>,String
+        -workflow.variable=db_pwd,<password>,String
+
+    KNIME allows String flow-var overrides without restrictions; the
+    credential object is built internally before any password field is
+    touched, so KNIME's password-overwrite rule is never violated.
+
+    See ml/knime/SETUP.md for the GUI setup steps.
 
 This script is safe to schedule daily (Windows Task Scheduler / cron) to
 keep predictions fresh.
@@ -34,11 +39,9 @@ Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
 
 import os
-import re
 import shutil
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -104,64 +107,6 @@ def parse_db_credentials():
     return unquote(p.username or ""), unquote(p.password or "")
 
 
-# ── CREDENTIAL NODE DISCOVERY ─────────────────────────────────────────────────
-def _find_model_param_name(settings_xml: Path) -> str | None:
-    """
-    Extract the user-set Parameter/Variable Name from a Credentials
-    Configuration node's settings.xml.
-
-    The XML has multiple <entry key="parameter-name" .../> elements at
-    different config nesting levels. The one we want lives directly under
-    <config key="model"> (NOT inside nested configs like credentialsValue).
-    Parse the XML and pick that exact one.
-    """
-    try:
-        tree = ET.parse(settings_xml)
-    except Exception:
-        return None
-    root = tree.getroot()
-    # Strip namespace for simple matching
-    ns = ""
-    if root.tag.startswith("{"):
-        ns = root.tag.split("}")[0] + "}"
-    # Find <config key="model"> child of root
-    for cfg in root.findall(f"{ns}config"):
-        if cfg.attrib.get("key") == "model":
-            # Look ONLY at direct children (don't recurse into nested configs).
-            # KNIME 5.x uses 'parameterName' (camelCase); older versions used
-            # 'parameter-name' (kebab). Accept both.
-            for entry in cfg.findall(f"{ns}entry"):
-                if entry.attrib.get("key") in ("parameterName", "parameter-name"):
-                    val = entry.attrib.get("value")
-                    if val:
-                        return val
-            break
-    return None
-
-
-def find_credential_config_nodes(workflow_dir: Path) -> list[tuple[str, str]]:
-    """
-    Find every Credentials Configuration node inside a workflow folder.
-    Returns list of (node_id, parameter_name) tuples.
-
-    Reads the model-level parameter-name from each node's settings.xml.
-    """
-    found = []
-    for d in workflow_dir.rglob("Credentials Configuration*"):
-        if not d.is_dir():
-            continue
-        m = re.search(r"\(#(\d+)\)", d.name)
-        if not m:
-            continue
-        node_id = m.group(1)
-        settings = d / "settings.xml"
-        if not settings.exists():
-            continue
-        param_name = _find_model_param_name(settings) or "credentials"
-        found.append((node_id, param_name))
-    return found
-
-
 # ── BATCH RUNNER ──────────────────────────────────────────────────────────────
 def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password: str) -> bool:
     """Run one workflow in batch mode. Returns True on exit code 0."""
@@ -181,19 +126,16 @@ def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password:
         "-application", "org.knime.product.KNIME_BATCH_APPLICATION",
         "-workflowDir=" + str(workflow_dir),
     ]
-    # NOTE: KNIME has no CLI mechanism for injecting credentials into
-    # Credentials Configuration nodes. We tried -credential (Workflow
-    # Credentials only), -workflow.variable (KNIME blocks password
-    # overrides), and -option (no 'credentials' type — only primitives).
-    # The only working path is to bake the encrypted password into the
-    # node's settings.xml using KNIME's own encryption code:
-    #
-    #     python scripts/bake_knime_password.py
-    #
-    # That script reads the password from .env and patches every
-    # Credentials Configuration node in both ~/knime-workspace/ and
-    # ml/knime/*.knwf. Run it once after install (or any time .env's
-    # DB password changes). See ml/knime/SETUP.md.
+    # Inject DB credentials as plain String flow variables. The workflows
+    # use a "Variable to Credentials" node that converts (db_user, db_pwd)
+    # strings into a credential object named "db", which the PostgreSQL
+    # Connectors bind to via the Authentication tab. This works because
+    # KNIME only blocks flow-var overrides on xpassword fields — plain
+    # strings are fine, and the credential object is built internally
+    # by Variable to Credentials before reaching any password field.
+    if db_user and db_password:
+        cmd.append(f"-workflow.variable=db_user,{db_user},String")
+        cmd.append(f"-workflow.variable=db_pwd,{db_password},String")
 
     t0 = datetime.now()
     res = subprocess.run(cmd, capture_output=True, text=True)
