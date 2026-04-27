@@ -543,25 +543,45 @@ def import_mysql_dims(venv: Path, install_dir: Path):
 
 
 def backfill_bronze_silver(venv: Path, install_dir: Path):
-    """Optional: run the full SMB + weather backfill. Can take 20-60 min."""
-    if not sys.stdin.isatty():
-        warn("Non-interactive: skipping backfill. Run manually later: python ingestion/fast_flow/watcher.py --scan")
-        return
-    if not ask_yes_no("Run full SMB + weather backfill now? (20-60 min, can be skipped)", default=False):
-        warn("Skipped. Later: `python ingestion/fast_flow/watcher.py --scan` then `--weather`")
-        return
-    print(f"{DIM}  Scanning SMB + running bronze->silver pipeline...{RESET}")
-    try:
-        run_script(venv, install_dir, "ingestion/fast_flow/watcher.py", "--scan",
-                   label="SMB backfill complete")
-    except Exception as e:
-        warn(f"SMB backfill failed: {e}")
-    print(f"{DIM}  Downloading weather + cleaning to silver...{RESET}")
+    """Run the full SMB + weather backfill. SMB part is optional (can be slow,
+    20-60 min on first install), but weather is required for gold predictions
+    to work, so we always run that.
+
+    Re-runs are idempotent — bronze->silver skips already-processed files,
+    weather skips already-downloaded forecasts."""
+    # SMB part is opt-out (default Yes) — can be slow but everything depends
+    # on it. Skipping it leaves gold facts empty.
+    run_smb = True
+    if sys.stdin.isatty():
+        run_smb = ask_yes_no(
+            "Run full SMB -> bronze -> silver backfill now? "
+            "(20-60 min, idempotent — safe to re-run)", default=True)
+    else:
+        warn("Non-interactive: defaulting to YES for SMB backfill")
+
+    if run_smb:
+        print(f"{DIM}  Scanning SMB + running bronze->silver pipeline...{RESET}")
+        try:
+            run_script(venv, install_dir, "ingestion/fast_flow/watcher.py", "--scan",
+                       label="SMB backfill complete")
+        except Exception as e:
+            warn(f"SMB backfill failed: {e}")
+            warn("  You can re-run later: python ingestion/fast_flow/watcher.py --scan")
+    else:
+        warn("Skipped SMB backfill. Re-run later with: "
+             "python ingestion/fast_flow/watcher.py --scan")
+
+    # Weather is REQUIRED — gold.fact_weather_hour and the consumption
+    # prediction workflow both depend on it. Always run, no prompt.
+    print(f"{DIM}  Downloading weather + cleaning to silver "
+          f"(required for gold predictions)...{RESET}")
     try:
         run_script(venv, install_dir, "ingestion/fast_flow/watcher.py", "--weather",
                    label="Weather backfill complete")
     except Exception as e:
         warn(f"Weather backfill failed: {e}")
+        warn("  Predictions will fail until this succeeds. Re-run later: "
+             "python ingestion/fast_flow/watcher.py --weather")
 
 
 def run_initial_etl(venv: Path, install_dir: Path):
