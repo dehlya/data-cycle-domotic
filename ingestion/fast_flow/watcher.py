@@ -33,6 +33,18 @@ NIGHTLY_HOUR  = 0  # midnight
 WEATHER_HOUR  = int(os.getenv("WEATHER_HOUR", "7"))   # hour to trigger weather
 WEATHER_MIN   = int(os.getenv("WEATHER_MIN", "30"))    # minute to trigger weather
 
+# Gold ETL refresh cadence (sensor facts).
+# Every N minutes the watcher kicks off populate_gold --sensors as a
+# subprocess so dashboards stay within N minutes of fresh.
+GOLD_INTERVAL_MIN = int(os.getenv("GOLD_INTERVAL_MIN", "15"))
+
+# Daily ML pipeline:
+#   1. weather download + clean (existing)
+#   2. populate_gold --weather  (new)
+#   3. run_knime_predictions     (new)
+#   4. cleanup_bronze            (new)
+# All triggered together at WEATHER_HOUR:WEATHER_MIN.
+
 # -- ANSI COLORS ---------------------------------------------------------------
 
 R  = "\033[0m"
@@ -168,6 +180,62 @@ def run_pipeline():
     return elapsed
 
 
+def _run_step(name: str, args: list[str], desc: str, timeout: int = 3600) -> bool:
+    """Run a Python step as a subprocess. Returns True on exit 0."""
+    print(f"  {YE}>{R} {name} -- {desc}")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-u", *args],
+            cwd=str(PROJECT_ROOT),
+            timeout=timeout,
+        )
+        if result.returncode == 0:
+            print(f"  {GR}v{R} {name} done\n")
+            return True
+        print(f"  {RE}x {name} exited with code {result.returncode}{R}\n")
+        return False
+    except subprocess.TimeoutExpired:
+        print(f"  {RE}x {name} timed out ({timeout}s){R}\n")
+        return False
+    except Exception as e:
+        print(f"  {RE}x {name} error: {e}{R}\n")
+        return False
+
+
+def run_gold_etl(scope: str = "--sensors") -> float:
+    """Run populate_gold for the given scope ('--sensors' or '--weather').
+    Non-blocking is the caller's responsibility (Popen vs run)."""
+    t_start = time.monotonic()
+    _run_step(
+        f"populate_gold {scope}",
+        ["-m", "etl.silver_to_gold.populate_gold", scope],
+        f"Silver -> Gold ({scope.lstrip('-')})",
+        timeout=1800,  # 30 min cap
+    )
+    return time.monotonic() - t_start
+
+
+def run_predictions() -> float:
+    """Run KNIME prediction workflows (motion + consumption)."""
+    t_start = time.monotonic()
+    runner = PROJECT_ROOT / "scripts" / "run_knime_predictions.py"
+    if not runner.exists():
+        print(f"  {YE}!{R} run_knime_predictions.py not found, skipping ML step\n")
+        return 0
+    _run_step("run_knime_predictions", [str(runner)], "ML predictions", timeout=3600)
+    return time.monotonic() - t_start
+
+
+def run_cleanup_bronze() -> float:
+    """Delete bronze files older than retention window (idempotent)."""
+    t_start = time.monotonic()
+    cleanup = PROJECT_ROOT / "scripts" / "cleanup_bronze.py"
+    if not cleanup.exists():
+        return 0
+    _run_step("cleanup_bronze", [str(cleanup)], "Free disk space", timeout=600)
+    return time.monotonic() - t_start
+
+
 def run_weather_pipeline():
     """Run the slow flow: weather download from sFTP then clean into Silver."""
     t_start = time.monotonic()
@@ -231,9 +299,10 @@ def run():
     print(f"{D}SMB      : {SMB_PATH}{R}")
     print(f"{D}Bronze   : {(PROJECT_ROOT / BRONZE_ROOT).resolve()}{R}")
     print(f"{D}Interval : {INTERVAL_SECS}s{R}")
-    print(f"{D}Fast flow: bulk_to_bronze -> flatten_sensors{R}")
-    print(f"{D}Slow flow: weather_download -> clean_weather (daily at {WEATHER_HOUR:02d}:{WEATHER_MIN:02d}){R}")
-    print(f"{D}Nightly  : full scan at {NIGHTLY_HOUR:02d}:00{R}")
+    print(f"{D}Fast flow : bulk_to_bronze -> flatten_sensors (every {INTERVAL_SECS}s){R}")
+    print(f"{D}Gold      : populate_gold --sensors (every {GOLD_INTERVAL_MIN} min){R}")
+    print(f"{D}Daily ML  : weather + populate_gold --weather + KNIME + cleanup at {WEATHER_HOUR:02d}:{WEATHER_MIN:02d}{R}")
+    print(f"{D}Nightly   : full scan at {NIGHTLY_HOUR:02d}:00{R}")
     print(f"{D}Flags    : --scan (full scan + pipeline) | --weather (weather only){R}")
     print(f"{D}Ctrl+C to stop{R}\n")
 
@@ -269,10 +338,12 @@ def run():
     skip_count = 0
     pipeline_count = 0
     weather_count = 0
+    gold_count = 0
     total_time = 0
     last_run_str = "never"
     nightly_done_today = False
     weather_done_today = False
+    last_gold_at = 0.0  # epoch seconds; 0 means "never run" -> first tick will fire
 
     try:
         while True:
@@ -326,20 +397,33 @@ def run():
                 print()
                 continue
 
-            # Daily weather pipeline
+            # Daily ML batch:
+            #   weather download/clean -> populate_gold weather -> KNIME -> cleanup
             current_min = int(time.strftime("%M"))
             if current_hour == WEATHER_HOUR and current_min >= WEATHER_MIN and not weather_done_today:
                 weather_done_today = True
                 weather_count += 1
                 print(f"\n{CY}{B}{'=' * 56}{R}")
-                print(f"{CY}{B}  WEATHER #{weather_count} -- {now}{R}")
+                print(f"{CY}{B}  DAILY ML BATCH #{weather_count} -- {now}{R}")
                 print(f"{CY}{B}{'=' * 56}{R}\n")
 
-                elapsed = run_weather_pipeline()
+                t0_batch = time.monotonic()
+                run_weather_pipeline()
+                run_gold_etl("--weather")
+                run_predictions()
+                run_cleanup_bronze()
+                elapsed = time.monotonic() - t0_batch
 
                 print(f"{CY}{B}{'=' * 56}{R}")
-                print(f"{GR}{B}  WEATHER #{weather_count} COMPLETE -- {elapsed:.0f}s{R}")
+                print(f"{GR}{B}  DAILY ML BATCH #{weather_count} COMPLETE -- {elapsed:.0f}s{R}")
                 print(f"{CY}{B}{'=' * 56}{R}")
+
+            # Periodic gold sensor refresh (every GOLD_INTERVAL_MIN minutes)
+            if time.time() - last_gold_at >= GOLD_INTERVAL_MIN * 60:
+                last_gold_at = time.time()
+                gold_count += 1
+                print(f"\n  {YE}[{now}] GOLD #{gold_count} -- refreshing sensor facts{R}")
+                run_gold_etl("--sensors")
 
             # Normal cycle: predict next files
             if last_known is None:
