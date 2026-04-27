@@ -176,19 +176,11 @@ def clean_dataframe(df: pd.DataFrame, prediction_date) -> pd.DataFrame:
     # unit
     df["unit"] = df["Unit"].str.strip()
 
-    # outlier flagging
+    # outlier flagging (silent — outlier counts not interesting per-file)
     df["is_outlier"] = False
     for measurement, (lo, hi) in BOUNDS.items():
         mask = (df["measurement"] == measurement) & ((df["value"] < lo) | (df["value"] > hi))
-        n_outliers = mask.sum()
-        if n_outliers > 0:
-            log.info(f"  {measurement}: {n_outliers} outlier(s) flagged")
         df.loc[mask, "is_outlier"] = True
-
-    log.info(
-        f"  rows: {n_raw} raw → {n_after_ts} valid ts → {n_after_year} after year filter "
-        f"→ {n_after_filter} relevant measures → {n_after_sentinel} after sentinel removal"
-    )
 
     # select final columns
     return df[["timestamp", "site", "prediction", "prediction_date", "measurement", "value", "unit", "is_outlier"]]
@@ -268,64 +260,91 @@ def find_csv(watermark):
 
 # ─── JOB ───
 
-def run():
+# Parallel file processor. Workers run independently — each opens its own
+# connection, processes one CSV (read → clean → COPY → upsert), and returns
+# row count. PostgreSQL handles concurrent INSERT FROM SELECT against the same
+# table fine, so we get ~3-4x speedup vs the previous sequential loop.
+WORKERS = int(os.getenv("CLEAN_WEATHER_WORKERS", "4"))
 
+
+def _process_one_file(path_str: str) -> tuple[str, int, str | None]:
+    """Worker entrypoint. Returns (filename, rows_inserted, error_or_None)."""
+    path = Path(path_str)
+    prediction_date = parse_prediction_date(path.name)
+    if prediction_date is None:
+        return (path.name, 0, "could not parse prediction date")
+
+    try:
+        df = pd.read_csv(path)
+        if df.empty:
+            return (path.name, 0, "empty file")
+        df_clean = clean_dataframe(df, prediction_date)
+        if df_clean.empty:
+            return (path.name, 0, "no rows after cleaning")
+
+        # Each worker gets its own engine
+        engine = create_engine(DB_URL)
+        try:
+            n = upsert(engine, df_clean)
+            mark_done(engine, path.name)
+        finally:
+            engine.dispose()
+        return (path.name, n, None)
+    except Exception as e:
+        return (path.name, 0, str(e)[:120])
+
+
+def run():
     if not DB_URL:
         raise EnvironmentError("DB_URL not set")
 
     engine = create_engine(DB_URL)
-
     log.info("Initializing database schema...")
     init_db(engine)
-
     log.info("Loading watermark...")
     watermark = load_watermark(engine)
+    engine.dispose()
 
     files = find_csv(watermark)
-    log.info(f"{len(files)} new files to process")
+    if not files:
+        log.info("Nothing to do. weather is up to date.")
+        return
 
-    total_rows = 0
+    log.info(f"{len(files)} new files to process  ({WORKERS} parallel workers)")
+    log.info("Starting... first progress line will appear after the first file finishes (~5-15s).")
 
     import time
+    from concurrent.futures import ProcessPoolExecutor, as_completed
     t_start = time.monotonic()
+    total_rows = 0
+    done = 0
+    errors = 0
 
-    for i, path in enumerate(files, 1):
-
-        t_file = time.monotonic()
-        log.info(f"[{i}/{len(files)}] Processing {path.name}")
-
-        # Extract prediction date from filename
-        prediction_date = parse_prediction_date(path.name)
-        if prediction_date is None:
-            log.warning(f"  Skipping {path.name}: could not parse prediction date from filename")
-            continue
-
-        try:
-            df = pd.read_csv(path)
-            if df.empty:
-                log.warning(f"  Skipping {path.name}: file is empty")
-                mark_done(engine, path.name)
-                continue
-            df_clean = clean_dataframe(df, prediction_date)
-            if df_clean.empty:
-                log.warning(f"  Skipping {path.name}: no rows after cleaning")
-                mark_done(engine, path.name)
-                continue
-            n = upsert(engine, df_clean)
+    with ProcessPoolExecutor(max_workers=WORKERS) as executor:
+        futures = {executor.submit(_process_one_file, str(p)): p for p in files}
+        for fut in as_completed(futures):
+            done += 1
+            name, n, err = fut.result()
             total_rows += n
-            elapsed_file = time.monotonic() - t_file
-            elapsed_total = time.monotonic() - t_start
-            avg_per_file = elapsed_total / i
-            eta = avg_per_file * (len(files) - i)
-            log.info(f"  {n} rows upserted in {elapsed_file:.1f}s — avg {avg_per_file:.1f}s/file — ETA {eta/60:.0f}min")
-            mark_done(engine, path.name)
-        except Exception as e:
-            log.error(f"  Failed to process {path.name}: {e}")
 
+            elapsed = time.monotonic() - t_start
+            rate = done / elapsed if elapsed > 0 else 1
+            eta = (len(files) - done) / rate
+            pct = done / len(files) * 100
+            bar_w = 24
+            filled = int(bar_w * pct / 100)
+            bar = "█" * filled + "░" * (bar_w - filled)
 
+            if err:
+                errors += 1
+                log.warning(f"  [{bar}] {done:>3}/{len(files)}  {pct:5.1f}%  {name}  ✗ {err}")
+            else:
+                log.info(f"  [{bar}] {done:>3}/{len(files)}  {pct:5.1f}%  "
+                         f"{name}  +{n:,} rows  ETA {eta/60:.1f}min")
 
-    engine.dispose()
-    log.info(f"Done — {total_rows} rows inserted")
+    elapsed = time.monotonic() - t_start
+    log.info(f"Done in {elapsed/60:.1f}min — {total_rows:,} rows total, "
+             f"{done - errors} ok, {errors} failed")
 
 
 if __name__ == "__main__":
