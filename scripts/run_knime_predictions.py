@@ -137,12 +137,16 @@ def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password:
         cmd.append(f"-workflow.variable=db_user,{db_user},String")
         cmd.append(f"-workflow.variable=db_pwd,{db_password},String")
 
-    # Cap KNIME's JVM heap. Default tries to allocate ~12GB which fails on
-    # smaller VMs ('insufficient memory for the Java Runtime Environment'
-    # / 'paging file is too small'). 4GB is plenty for our workflows.
-    # Override via KNIME_XMX env var (e.g. "8g") if you have memory to spare.
-    xmx = os.getenv("KNIME_XMX", "4g")
-    cmd.extend(["-vmargs", f"-Xmx{xmx}"])
+    # IMPORTANT: do NOT pass -vmargs from here. Doing so makes the Eclipse
+    # launcher use --launcher.overrideVmargs, which wipes ALL the
+    # --add-opens flags KNIME's knime.ini sets up for its database driver
+    # classloader (which uses reflection on java.lang). Result: every PG
+    # Connector fails with InaccessibleObjectException + NoClassDefFoundError
+    # on DBDriverRegistry$DriverClassLoader.
+    #
+    # If you need to lower the heap for a memory-tight VM, edit
+    #   C:\Program Files\KNIME\knime.ini
+    # and change the -Xmx line (default ~12g). Don't try to override here.
 
     t0 = datetime.now()
     res = subprocess.run(cmd, capture_output=True, text=True)
