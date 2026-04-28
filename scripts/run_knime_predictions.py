@@ -38,6 +38,7 @@ keep predictions fresh.
 Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
 
+import ctypes
 import os
 import shutil
 import subprocess
@@ -105,6 +106,119 @@ def parse_db_credentials():
         return None, None
     p = urlparse(DB_URL)
     return unquote(p.username or ""), unquote(p.password or "")
+
+
+# ── MEMORY HYGIENE ────────────────────────────────────────────────────────────
+# Apps that hog memory and aren't needed during a KNIME batch run.
+# We don't kill 'python' or 'pythonw' here — that would shoot the watcher /
+# admin pane in the foot.
+MEMORY_HOG_PROCESSES = [
+    "chrome",        # Chrome
+    "msedge",        # Edge
+    "firefox",       # Firefox
+    "PBIDesktop",    # Power BI Desktop (it'll re-open clean later)
+    "Code",          # VS Code
+    "knime",         # any leftover KNIME GUI
+]
+
+
+def free_memory_gb() -> float | None:
+    """Return free physical memory in GB, or None if can't check."""
+    if os.name != "nt":
+        try:
+            import resource  # noqa
+            return None  # not implemented for non-Windows
+        except Exception:
+            return None
+    try:
+        # GlobalMemoryStatusEx on Windows
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        m = MEMORYSTATUSEX()
+        m.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        return m.ullAvailPhys / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def kill_memory_hogs() -> int:
+    """Stop processes in MEMORY_HOG_PROCESSES. Returns how many were killed.
+    Best-effort — never raises."""
+    killed = 0
+    if os.name == "nt":
+        for name in MEMORY_HOG_PROCESSES:
+            try:
+                # /F = force, /IM = image name, /T = also kill child trees
+                r = subprocess.run(
+                    ["taskkill", "/F", "/T", "/IM", f"{name}.exe"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                # taskkill returns 0 if killed, 128 if not running — both fine
+                if r.returncode == 0:
+                    # Count "SUCCESS:" lines as proxy for kill count
+                    killed += r.stdout.count("SUCCESS:")
+            except Exception:
+                continue
+    else:
+        for name in MEMORY_HOG_PROCESSES:
+            try:
+                subprocess.run(["pkill", "-f", name], capture_output=True, timeout=5)
+            except Exception:
+                continue
+    return killed
+
+
+def cleanup_jvm_dumps():
+    """KNIME OOM crashes leave hs_err_pid*.mdmp + replay_pid*.log all over
+    the project root. Sweep them before each run so they don't pile up."""
+    root = Path(__file__).resolve().parent.parent
+    swept = 0
+    for pat in ("hs_err_pid*.mdmp", "hs_err_pid*.log", "replay_pid*.log"):
+        for p in root.glob(pat):
+            try:
+                p.unlink()
+                swept += 1
+            except Exception:
+                pass
+    return swept
+
+
+def memory_preflight():
+    """Run before launching KNIME. Cleans crash dumps, optionally frees
+    memory, warns if tight."""
+    n = cleanup_jvm_dumps()
+    if n:
+        print(f"  {DIM}cleaned up {n} JVM crash dump file(s){RESET}")
+
+    free_gb = free_memory_gb()
+    if free_gb is None:
+        return  # couldn't check, skip
+    print(f"  {DIM}free physical memory: {free_gb:.1f} GB{RESET}")
+
+    auto_free = os.getenv("KNIME_FREE_MEMORY", "0") == "1"
+    if free_gb < 4 and auto_free:
+        print(f"  {YELLOW}closing memory-hog apps (KNIME_FREE_MEMORY=1)...{RESET}")
+        killed = kill_memory_hogs()
+        if killed:
+            print(f"  {GREEN}closed {killed} process(es){RESET}")
+            free_gb_after = free_memory_gb()
+            if free_gb_after:
+                print(f"  {DIM}free memory now: {free_gb_after:.1f} GB{RESET}")
+    elif free_gb < 4:
+        warn(f"Low free memory ({free_gb:.1f} GB). KNIME workflows may OOM.")
+        warn(f"  Close Chrome / Edge / Power BI Desktop / VS Code, OR set KNIME_FREE_MEMORY=1 in .env to auto-close.")
 
 
 # ── BATCH RUNNER ──────────────────────────────────────────────────────────────
@@ -192,6 +306,9 @@ def main():
     selected = args if args else list(WORKFLOWS.keys())
 
     header(f"Running {len(selected)} workflow(s)")
+    # Memory hygiene — clean up old crash dumps + warn / auto-free if low
+    memory_preflight()
+
     successes = failures = 0
     for key in selected:
         wf_dir = KNIME_WORKSPACE / WORKFLOWS[key]
