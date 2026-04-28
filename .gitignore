@@ -34,3 +34,5 @@ Thumbs.db
 **/port_*/
 **/.savedWithData
 **/.knimeLock
+hs_err_*.mdmp
+hs_err_*.log
