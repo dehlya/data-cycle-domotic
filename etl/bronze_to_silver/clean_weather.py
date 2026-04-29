@@ -21,6 +21,14 @@ BRONZE_ROOT = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
 DB_URL = os.getenv("DB_URL")
 WEATHER_MIN_YEAR = int(os.getenv("WEATHER_MIN_YEAR", "2023"))
 
+# Same aggressive-cleanup behavior as flatten_sensors.py: after a CSV is
+# successfully cleaned + upserted into silver + watermarked, delete it from
+# bronze. Set KEEP_BRONZE=1 to disable. Filenames go into processed.log so
+# future SMB rescans don't re-fetch them.
+DELETE_BRONZE_ON_SILVER = os.getenv("KEEP_BRONZE", "0") != "1"
+PROCESSED_LOG = (BRONZE_ROOT.parent / "processed.log") if BRONZE_ROOT.is_absolute() \
+    else (Path(__file__).resolve().parent.parent.parent / BRONZE_ROOT.parent / "processed.log")
+
 
 # ─── LOGGING ───
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
@@ -245,16 +253,29 @@ def upsert(engine, df):
     return n
 
 
+def _load_processed_log() -> set[str]:
+    """Load filenames already imported + cleaned up from bronze. Same skip-list
+    bulk_to_bronze.py uses, so we don't re-process files that were already
+    cleaned and deleted from bronze."""
+    if not PROCESSED_LOG.exists():
+        return set()
+    try:
+        with PROCESSED_LOG.open(encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except Exception:
+        return set()
+
+
 def find_csv(watermark):
-    """Find new CSV files in bronze directory that are not in watermark."""
-
+    """Find new CSV files in bronze directory that are not in the watermark
+    or in the processed.log skip-list."""
     root = BRONZE_ROOT / "weather"
+    if not root.exists():
+        return []
 
+    skip = watermark | _load_processed_log()
     all_files = list(root.rglob("*.csv"))
-
-    new_files = [f for f in all_files if f.name not in watermark]
-
-    return new_files
+    return [f for f in all_files if f.name not in skip]
 
 
 
@@ -267,6 +288,21 @@ def find_csv(watermark):
 WORKERS = int(os.getenv("CLEAN_WEATHER_WORKERS", "4"))
 
 
+def _delete_bronze_csv(path: Path) -> None:
+    """Delete a bronze weather CSV that just made it into silver and append
+    its filename to processed.log so SMB rescans skip it. Best-effort."""
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        return
+    try:
+        PROCESSED_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with PROCESSED_LOG.open("a", encoding="utf-8") as f:
+            f.write(path.name + "\n")
+    except Exception:
+        pass
+
+
 def _process_one_file(path_str: str) -> tuple[str, int, str | None]:
     """Worker entrypoint. Returns (filename, rows_inserted, error_or_None)."""
     path = Path(path_str)
@@ -277,9 +313,25 @@ def _process_one_file(path_str: str) -> tuple[str, int, str | None]:
     try:
         df = pd.read_csv(path)
         if df.empty:
+            # Empty source — mark as done so we don't keep re-reading it
+            engine = create_engine(DB_URL)
+            try:
+                mark_done(engine, path.name)
+            finally:
+                engine.dispose()
+            if DELETE_BRONZE_ON_SILVER:
+                _delete_bronze_csv(path)
             return (path.name, 0, "empty file")
+
         df_clean = clean_dataframe(df, prediction_date)
         if df_clean.empty:
+            engine = create_engine(DB_URL)
+            try:
+                mark_done(engine, path.name)
+            finally:
+                engine.dispose()
+            if DELETE_BRONZE_ON_SILVER:
+                _delete_bronze_csv(path)
             return (path.name, 0, "no rows after cleaning")
 
         # Each worker gets its own engine
@@ -289,6 +341,11 @@ def _process_one_file(path_str: str) -> tuple[str, int, str | None]:
             mark_done(engine, path.name)
         finally:
             engine.dispose()
+
+        # Aggressive cleanup: delete the bronze CSV now that silver has it
+        if DELETE_BRONZE_ON_SILVER:
+            _delete_bronze_csv(path)
+
         return (path.name, n, None)
     except Exception as e:
         return (path.name, 0, str(e)[:120])
