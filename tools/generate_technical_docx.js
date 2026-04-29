@@ -411,7 +411,15 @@ main.push(tbl(
   [4500, 4860],
 ));
 
-main.push(h2("6.1 Idempotency guarantees"));
+main.push(h2("6.1 COPY into temp table — the silver upsert hot-path"));
+main.push(p("The original flatten_sensors used INSERT ... VALUES (:a, :b, ...) ON CONFLICT DO UPDATE per row via SQLAlchemy. A 220 k-file backfill took ~3 hours, almost all of which was DB write time."));
+main.push(p("Switched to: psycopg2.copy_expert streams rows into a TEMP TABLE ON COMMIT DROP, then a single INSERT INTO silver.sensor_events SELECT DISTINCT ON (...) ... FROM tmp_table ON CONFLICT DO UPDATE finishes the merge."));
+main.push(bullet("COPY skips per-statement parsing — bytes go directly into the temp table."));
+main.push(bullet("One INSERT ... SELECT ... ON CONFLICT is a single set-based operation, minimal overhead."));
+main.push(bullet("DISTINCT ON dedupes within-batch (PostgreSQL forbids upserting the same key twice in one statement)."));
+main.push(callout("Result", "3-hour backfill → 10–15 minutes (~50–150x speedup measured on the project VM).", TEAL));
+
+main.push(h2("6.2 Idempotency guarantees"));
 main.push(p("Every step is safe to re-run:"));
 main.push(bullet("bulk_to_bronze: skips existing files in bronze."));
 main.push(bullet("flatten_sensors: silver.etl_watermark skips already-processed files."));
@@ -425,7 +433,8 @@ main.push(para([new PageBreak()]));
 
 // ============= 7. ADRs =============
 main.push(h1("7 · Architecture decision records"));
-main.push(p("Ten decisions documented along the way. Each one captures the context, the alternatives considered, the chosen path, and the trade-offs accepted."));
+main.push(p("Eight decisions documented along the way. Only choices where viable alternatives existed are recorded as ADRs — the medallion architecture itself was prescribed by the course's reference architecture (PDF chapter \"Architecture — Medaillon architecture\"), so it is described in chapter 1, not as an ADR. Likewise, the COPY-based silver upsert pattern is a performance optimisation captured in chapter 6.1, not a high-level architectural choice."));
+main.push(p("Each ADR captures the context, the chosen path, the rationale, and the trade-offs accepted."));
 
 const adrs = [
   {
@@ -437,23 +446,15 @@ const adrs = [
     tradeoffs: "No web UI for DAGs (replaced by the Streamlit admin pane); no retry/SLA primitives (subprocess return codes + warning logs cover what we need); no DAG-level dependency expression (the watcher's three time triggers call functions in fixed order).",
   },
   {
-    id: "ADR 002", title: "Medallion architecture (bronze · silver · gold)",
-    date: "2026-02",
-    context: "Three sources of varying shapes (JSON / CSV / MySQL rows) need to be unified for ML and BI consumption.",
-    decision: "Three layers — bronze (raw, immutable, on filesystem), silver (cleaned, normalised, in PostgreSQL), gold (star schema for OLAP / ML / BI, in PostgreSQL).",
-    rationale: "Standard pattern for IoT / sensor pipelines. Bronze gives a re-runnable source-of-truth. Silver isolates parsing/cleaning from analytic concerns. Gold's star schema is what Power BI and KNIME expect.",
-    tradeoffs: "Storage cost (three copies of the data) — mitigated by aggressive bronze cleanup (ADR 003) and Postgres compression. Two ETL hops instead of one — but each hop is small and idempotent.",
-  },
-  {
-    id: "ADR 003", title: "Aggressive bronze cleanup (delete after silver insert)",
+    id: "ADR 002", title: "Aggressive bronze cleanup (delete after silver insert)",
     date: "2026-04",
-    context: "2 apartments × 1 file/min × 365 days = 1 M JSON files/year/apt. Bronze grows unbounded if untouched. ~10 KB per file → ~20 GB/year just for sensors.",
-    decision: "After every successful silver insert + watermark commit, delete the bronze JSONs from disk (default on; opt-out with KEEP_BRONZE=1). Filenames are appended to storage/processed.log so future SMB rescans do not re-copy them.",
-    rationale: "The original SMB share is the durable copy; bronze was always meant as a staging area. Silver fully reconstructs the relevant data. Disk space matters on a school-allocated VM.",
-    tradeoffs: "If silver gets corrupted / dropped, full re-fetch from SMB is the only recovery (slower but possible). Less obvious 'raw audit trail' — but silver.etl_watermark records every filename that landed.",
+    context: "The course's reference architecture (PDF chapter \"Architecture — Medaillon architecture\") describes the bronze layer as \"Stored incrementally, with all history.\" In our deployment, 2 apartments × 1 file/min × 365 days = 1 M JSON files/year/apt; ~10 KB per file → ~20 GB/year just for sensors. Bronze grows unbounded if we follow the reference exactly.",
+    decision: "Deviate from the reference: after every successful silver insert + watermark commit, delete the bronze JSONs from disk (default on; opt-out with KEEP_BRONZE=1). Filenames are appended to storage/processed.log so future SMB rescans do not re-copy them.",
+    rationale: "The original SMB share is the durable copy; bronze on the VM was always a staging area. Silver fully reconstructs the relevant data. The course-allocated VM has limited disk; bounded bronze is more important than the immutable-archive property.",
+    tradeoffs: "If silver gets corrupted or dropped, full re-fetch from SMB is the only recovery (slower but possible). Less obvious raw audit trail — partly compensated by silver.etl_watermark which records every filename that landed.",
   },
   {
-    id: "ADR 004", title: "KNIME credential injection via Variable to Credentials",
+    id: "ADR 003", title: "KNIME credential injection via Variable to Credentials",
     date: "2026-04",
     context: "KNIME workflows need DB credentials at runtime, but those credentials live in .env per user. Hardcoding is unacceptable. Four KNIME mechanisms were tried unsuccessfully (inline password, Workflow Credentials + -credential, -workflow.variable directly into password, -option=NODE,credentials).",
     decision: "Use a Variable to Credentials node bridge: two String Configuration nodes (db_user, db_pwd) at workflow root → Variable to Credentials node → PG Connectors bind to credential 'db'. At runtime the Python wrapper passes -workflow.variable=db_user,...,String + -workflow.variable=db_pwd,...,String.",
@@ -461,7 +462,7 @@ const adrs = [
     tradeoffs: "Workflows need a one-time GUI setup (documented in ml/knime/SETUP.md) that creates the three nodes + wiring. Re-exporting the .knwf must preserve the wiring.",
   },
   {
-    id: "ADR 005", title: "GDPR — keep first names, anonymise everything else",
+    id: "ADR 004", title: "GDPR — keep first names, anonymise everything else",
     date: "2026-04",
     context: "The dim_apartment table has owner_user_id, building_name, occupant_name, etc. Some are personal data under GDPR Art. 4(1).",
     decision: "In the gold.dim_apartment view exposed to BI / ML: occupant_name keeps first names (e.g. 'Jimmy', 'Jeremie'); owner_user_id is set to NULL; building_name is replaced with 'Building <id>'; sensor data keeps apartment_key as the only re-identifier. Power BI enforces RLS.",
@@ -469,7 +470,7 @@ const adrs = [
     tradeoffs: "A determined attacker with side knowledge could re-identify 'Jimmy' as a specific person. Documented as a known limitation; production rollout would need a GDPR review with the school's DPO.",
   },
   {
-    id: "ADR 006", title: "Two-role Postgres install (admin + app)",
+    id: "ADR 005", title: "Two-role Postgres install (admin + app)",
     date: "2026-03",
     context: "Should we run everything as the Postgres superuser, or split?",
     decision: "Two roles — Admin (typically postgres) used ONLY at install time, in memory; App (domotic) has DML/DDL on silver and gold schemas only.",
@@ -477,15 +478,7 @@ const adrs = [
     tradeoffs: "Slightly more complex install (one extra prompt for the admin password). Adding a new schema requires either the admin's password again, or granting domotic CREATE on the database.",
   },
   {
-    id: "ADR 007", title: "COPY into temp table for silver upserts",
-    date: "2026-04",
-    context: "Original flatten_sensors used INSERT ... VALUES (:a, :b, ...) ON CONFLICT DO UPDATE per row via SQLAlchemy. A 220 k-file backfill took ~3 hours, almost all of which was DB write time.",
-    decision: "Use psycopg2.copy_expert to stream rows into a TEMP TABLE ON COMMIT DROP, then a single INSERT INTO silver.sensor_events SELECT DISTINCT ON (...) ... FROM tmp_table ON CONFLICT DO UPDATE.",
-    rationale: "COPY skips per-statement parsing — bytes go directly into the temp table. One INSERT ... SELECT ... ON CONFLICT is a single set-based operation, minimal overhead. DISTINCT ON dedupes within-batch.",
-    tradeoffs: "COPY format requires careful CSV escaping (handled by Python's csv module with QUOTE_MINIMAL + NULL ''). Per-batch temp table creation has a small fixed overhead, amortized over 2 000 files per batch. Result: 3-hour backfill → 10–15 minutes (~50–150x speedup).",
-  },
-  {
-    id: "ADR 008", title: "Streamlit admin pane in addition to status.py CLI",
+    id: "ADR 006", title: "Streamlit admin pane in addition to status.py CLI",
     date: "2026-04",
     context: "Operators need to check pipeline freshness, trigger ad-hoc ETL runs, read logs, see config. A CLI tool covers it for technical users; non-technical users prefer a GUI.",
     decision: "Build scripts/admin.py (Streamlit) for the GUI. Keep status.py (CLI) for terminal users. Both read the same data.",
@@ -493,7 +486,7 @@ const adrs = [
     tradeoffs: "Streamlit adds ~50 MB to venv. No auth on the admin pane — but it binds to localhost only by default, so reaching it requires already being on the VM.",
   },
   {
-    id: "ADR 009", title: "Power BI Desktop only (no Service)",
+    id: "ADR 007", title: "Power BI Desktop only (no Service)",
     date: "2026-04",
     context: "The natural deployment for view-only Power BI is Power BI Service (cloud). The HES-SO Microsoft 365 tenant restricts free Power BI signup, so individual students cannot publish to Service.",
     decision: "Ship the .pbix as a local Desktop file. Document F11 fullscreen as the 'view mode' approximation.",
@@ -501,7 +494,7 @@ const adrs = [
     tradeoffs: "End users see editing chrome until they press F11. No automatic refresh — users hit Refresh manually or use the admin pane's 'Refresh Power BI' button (sends Ctrl+Shift+F5).",
   },
   {
-    id: "ADR 010", title: "Self-contained installer + web wizard",
+    id: "ADR 008", title: "Self-contained installer + web wizard",
     date: "2026-04",
     context: "The 'for dummies' install goal means a non-technical user should run one command to deploy everything.",
     decision: "Two-step install: Web wizard (/install page) where the user fills in a form + Single Python file generated client-side with all values baked in; user downloads it and runs python data-cycle-installer.py. The wizard's JavaScript renders installer/install_template.py by replacing {{PLACEHOLDER}} tokens. Re-runs are idempotent.",
@@ -526,8 +519,321 @@ for (const adr of adrs) {
 
 main.push(para([new PageBreak()]));
 
-// ============= 8. PROJECT LAYOUT =============
-main.push(h1("8 · Project layout"));
+// ============= 8. TECHNOLOGY STACK =============
+main.push(h1("8 · Technology stack"));
+main.push(tbl(
+  ["Layer", "Tool", "Version", "Why"],
+  [
+    ["Language",          "Python",            "3.11",          "Single language across ingestion, ETL, ML wrappers, admin pane — easy hire/handoff"],
+    ["Database",          "PostgreSQL",        "17",            "Strong COPY performance, JSON support for raw bronze, materialised views, free"],
+    ["Async I/O",         "asyncio + aiohttp", "3.9",           "Used by recup.py for concurrent sensor polling"],
+    ["MySQL client",      "aiomysql",          "0.2",           "Reads the school's pidb apartment metadata"],
+    ["Postgres driver",   "psycopg2-binary",   "2.9",           "Wins over asyncpg here for COPY support"],
+    ["ORM / DDL helper",  "SQLAlchemy",        "2.0",           "Used for schema bootstrap; bulk inserts go through psycopg2 directly"],
+    ["DataFrames",        "pandas",            "2.1",           "Weather CSV cleaning"],
+    ["sFTP",              "paramiko",          "3.4",           "Weather forecast download"],
+    ["ML — classical",    "scikit-learn",      "1.3",           "Baseline models / Python-side experiments"],
+    ["ML — workflow",     "KNIME Analytics Platform", "5.x batch", "Course requirement; PG Connectors built-in"],
+    ["BI",                "Power BI Desktop",  "latest",        "Course requirement; RLS at model layer"],
+    ["Admin UI",          "Streamlit",         "1.32",          "One-pip GUI for non-technical operators"],
+    ["Config",            "python-dotenv",     "1.0",           "All runtime config in .env"],
+    ["Test",              "pytest",            "7.4",           "Smoke tests for parsing + idempotency"],
+  ],
+  [1800, 2400, 1500, 3660],
+));
+
+main.push(para([new PageBreak()]));
+
+// ============= 9. DATABASE SCHEMAS DETAIL =============
+main.push(h1("9 · Database schemas — detailed"));
+
+main.push(h2("9.1 Silver schema"));
+main.push(tbl(
+  ["Table", "Source", "Purpose"],
+  [
+    ["silver.sensor_events", "JSON files (apartments)", "Long-format events. One row per (apartment, room, sensor_type, field, timestamp)."],
+    ["silver.weather_forecasts", "CSV files (sFTP)", "All forecast rows, one row per (timestamp, site, prediction-step, measurement)."],
+    ["silver.dim_buildings", "MySQL buildings", "Apartment metadata mirrored from school DB (anonymised in gold)."],
+    ["silver.dim_rooms / dim_devices / dim_sensors", "MySQL rooms / devices / sensors", "Physical asset inventory."],
+    ["silver.log_sensor_errors", "MySQL DIErrors (raw)", "Untyped MySQL dump."],
+    ["silver.di_errors_clean", "transform from log_sensor_errors", "Typed + apartment-mapped + severity heuristic. Joined into gold.fact_device_health_day."],
+    ["silver.etl_watermark", "self", "Filenames already imported (sensor pipeline idempotency)."],
+    ["silver.weather_watermark", "self", "Filenames already imported (weather pipeline idempotency)."],
+  ],
+  [3200, 2400, 3760],
+));
+
+main.push(h2("9.2 Gold star schema"));
+main.push(p("Conformed dimensions:"));
+main.push(bullet("dim_apartment — apartment_key (PK), apartment_id, building_name (anon), occupant_name (first name only)"));
+main.push(bullet("dim_room — room_key, room_name, apartment_key (FK)"));
+main.push(bullet("dim_device — device_key, device_id, sensor_type, room_key, apartment_key"));
+main.push(bullet("dim_date — date_key (YYYYMMDD), year, month, quarter, weekday"));
+main.push(bullet("dim_datetime — datetime_key (YYYYMMDDHHMM), timestamp_utc, hour, minute, is_business_hour"));
+main.push(bullet("dim_tariff — electricity rate per hour-of-day (used by mv_energy_with_cost)"));
+main.push(bullet("dim_weather_site — weather_site_key, site_name (e.g. \"Aadorf / Tänikon\")"));
+
+main.push(p("Fact tables:"));
+main.push(bullet("fact_environment_minute — temperature, humidity, CO₂, noise, pressure, anomaly flag"));
+main.push(bullet("fact_energy_minute — power_w, energy_kwh, is_valid"));
+main.push(bullet("fact_presence_minute — motion_flag, door_open_flag, window_open_flag"));
+main.push(bullet("fact_device_health_day — error_count, missing_readings, uptime_pct, battery_min/avg"));
+main.push(bullet("fact_weather_hour — temperature, humidity, precipitation, radiation, n_model_runs"));
+main.push(bullet("fact_prediction_motion — KNIME-written, motion probability per (apartment, room, target hour)"));
+main.push(bullet("fact_prediction_consumption — KNIME-written, predicted kWh per apartment per future hour"));
+
+main.push(h2("9.3 Materialised views"));
+main.push(bullet("mv_energy_with_cost — joins fact_energy_minute with dim_tariff to surface CHF cost per minute. Refreshed by populate_gold."));
+
+main.push(para([new PageBreak()]));
+
+// ============= 10. SCRIPTS REFERENCE =============
+main.push(h1("10 · Scripts reference"));
+main.push(p("Every script entry-point in the repo, with what it does and how to call it:"));
+
+main.push(h2("10.1 Ingestion"));
+main.push(tbl(
+  ["Script", "What it does", "Run"],
+  [
+    ["ingestion/fast_flow/watcher.py", "Long-running scheduler — bronze→silver every minute, gold every 15 min, daily ML batch at 06:30", "python ingestion/fast_flow/watcher.py [--scan|--weather]"],
+    ["ingestion/fast_flow/bulk_to_bronze.py", "SMB share → local bronze. Predictive (default) or full-scan mode.", "python ingestion/fast_flow/bulk_to_bronze.py [--full]"],
+    ["ingestion/slow_flow/weather_download.py", "sFTP → bronze. Sequential download with progress bar.", "python ingestion/slow_flow/weather_download.py"],
+  ],
+  [3500, 4200, 1660],
+));
+
+main.push(h2("10.2 ETL"));
+main.push(tbl(
+  ["Script", "What it does", "Run"],
+  [
+    ["etl/bronze_to_silver/create_silver.py", "DDL — creates silver schema + tables", "python -m etl.bronze_to_silver.create_silver"],
+    ["etl/bronze_to_silver/flatten_sensors.py", "JSON → silver.sensor_events (parallel + COPY upsert)", "python -m etl.bronze_to_silver.flatten_sensors"],
+    ["etl/bronze_to_silver/clean_weather.py", "CSV → silver.weather_forecasts (4 parallel workers)", "python -m etl.bronze_to_silver.clean_weather"],
+    ["etl/bronze_to_silver/import_mysql_to_silver.py", "MySQL dim tables → silver + DIErrors transform", "python -m etl.bronze_to_silver.import_mysql_to_silver"],
+    ["etl/silver_to_gold/create_gold.py", "DDL — creates gold star schema", "python -m etl.silver_to_gold.create_gold"],
+    ["etl/silver_to_gold/populate_gold.py", "Orchestrator: dimensions + sensors + weather", "python -m etl.silver_to_gold.populate_gold [--sensors|--weather]"],
+  ],
+  [3500, 4200, 1660],
+));
+
+main.push(h2("10.3 ML / BI / Admin"));
+main.push(tbl(
+  ["Script", "What it does", "Run"],
+  [
+    ["scripts/run_knime_predictions.py", "Invokes knime.exe in batch with credential injection", "python scripts/run_knime_predictions.py [motion|consumption]"],
+    ["scripts/configure_bi_knime.py", "Patches host/port/db in .pbix and .knwf at install", "python scripts/configure_bi_knime.py"],
+    ["scripts/deploy_knime.py", "Extracts .knwf into ~/knime-workspace", "python scripts/deploy_knime.py"],
+    ["scripts/cleanup_bronze.py", "Daily retention pass (delete files older than BRONZE_RETENTION_DAYS)", "python scripts/cleanup_bronze.py"],
+    ["scripts/admin.py", "Streamlit admin pane", "streamlit run scripts/admin.py (or admin.bat)"],
+    ["scripts/status.py", "CLI version of admin pane", "python scripts/status.py"],
+  ],
+  [3500, 4200, 1660],
+));
+
+main.push(para([new PageBreak()]));
+
+// ============= 11. DEPLOYMENT =============
+main.push(h1("11 · Deployment"));
+
+main.push(h2("11.1 Web wizard"));
+main.push(p("The website's /install page presents a form. The user fills:"));
+main.push(bullet("Postgres admin credentials (used only at install time, never written)"));
+main.push(bullet("App user / DB / host / port"));
+main.push(bullet("MySQL connection string"));
+main.push(bullet("sFTP host / user / password"));
+main.push(bullet("SMB share / drive letter / credentials"));
+main.push(bullet("Bronze root path"));
+main.push(p("On submit, JavaScript renders installer/install_template.py with all values baked in, prompts a download (data-cycle-installer.py). No credentials touch any backend."));
+
+main.push(h2("11.2 The installer (10 steps)"));
+main.push(tbl(
+  ["#", "Step", "Time"],
+  [
+    ["1", "Prerequisites — check Python ≥ 3.11, git, Power BI, KNIME", "5 s"],
+    ["2", "Clone repo (or git pull if existing)", "30-60 s"],
+    ["3", "Write .env", "<1 s"],
+    ["4", "Python venv + pip install requirements", "2-3 min"],
+    ["5", "Pre-flight — mount SMB, validate Postgres / MySQL / sFTP", "5-10 s"],
+    ["6", "Create app DB + user + silver/gold schemas", "10-30 s"],
+    ["7", "Bootstrap silver — MySQL dims + (opt) SMB backfill + weather", "25-35 min"],
+    ["8", "Initial gold ETL", "30-60 s"],
+    ["9", "Verify + auto-config BI/KNIME (.pbix / .knwf host patching)", "30-60 s"],
+    ["10", "Optional autostart watcher in shell:startup", "<1 s"],
+  ],
+  [400, 7200, 1760],
+));
+
+main.push(p("Total typical install on the project VM: 45-60 minutes. Idempotent — re-running picks up where it stopped."));
+
+main.push(h2("11.3 Post-install"));
+main.push(bullet("Admin dashboard auto-launches in browser at http://localhost:8501"));
+main.push(bullet("Watcher registered in shell:startup → runs on every login"));
+main.push(bullet("Power BI .pbix has host/port/db pre-patched to local Postgres"));
+main.push(bullet("KNIME workflows extracted into ~/knime-workspace/, ready for batch invocation"));
+
+main.push(para([new PageBreak()]));
+
+// ============= 12. SERVICES & PROCESSES =============
+main.push(h1("12 · Services & processes"));
+main.push(p("Long-running and scheduled processes on the VM after install:"));
+main.push(tbl(
+  ["Process", "Schedule", "Notes"],
+  [
+    ["postgresql-x64-17", "Always running (Windows service)", "Listens on 5432; created by Postgres install, not by us"],
+    ["watcher.py (pythonw.exe)", "Auto-start on user login (shell:startup .lnk)", "Single Python process; embeds the scheduler"],
+    ["knime.exe (batch)", "Spawned by watcher daily at 06:30", "Two prediction workflows; ~5-15 min each"],
+    ["streamlit run admin.py", "On-demand (admin.bat double-click or installer prompt)", "Localhost:8501; hand-launched"],
+    ["bulk_to_bronze + flatten_sensors + clean_weather", "Subprocesses spawned by watcher", "Inherit watcher's process; finish in seconds (continuous) or minutes (backfill)"],
+  ],
+  [3000, 3000, 3360],
+));
+
+main.push(p("Stopping the watcher: Stop-Process -Name pythonw -Force, or kill via Task Manager. Re-enable autostart by restoring the shortcut in shell:startup."));
+
+main.push(para([new PageBreak()]));
+
+// ============= 13. MONITORING & LOGS =============
+main.push(h1("13 · Monitoring & logs"));
+main.push(tbl(
+  ["File", "Producer", "Contents"],
+  [
+    ["install.log", "data-cycle-installer.py", "Every step of the install with [HH:MM:SS] timestamps"],
+    ["logs/clean_weather.log", "clean_weather.py", "Persistent log handler; per-file processing details"],
+    ["storage/admin_logs/*.log", "Streamlit admin pane buttons", "Output of every action triggered from the dashboard"],
+    ["storage/processed.log", "flatten_sensors / clean_weather", "Filenames imported to silver and removed from bronze (skip-list)"],
+    ["watcher stdout (terminal)", "watcher.py", "Live progress; not persisted by default"],
+  ],
+  [3500, 2500, 3360],
+));
+main.push(p("All logs are plain text — the admin pane's log viewer tails the last 300 lines with ANSI colour codes stripped. For long-term log retention, redirect watcher's output to a file (e.g. python watcher.py >> logs/watcher.log 2>&1)."));
+
+main.push(callout("Health check at a glance",
+  "Open the admin pane at http://localhost:8501. Six freshness tiles (sensors environment / energy / presence, weather forecasts, motion predictions, consumption predictions) — all green = healthy.",
+  TEAL));
+
+main.push(para([new PageBreak()]));
+
+// ============= 14. TROUBLESHOOTING =============
+main.push(h1("14 · Troubleshooting"));
+main.push(tbl(
+  ["Symptom", "Likely cause", "Fix"],
+  [
+    ["Database red on admin pane", "Postgres service stopped, wrong .env DB_URL, or password mismatch", "Start-Service postgresql-x64-17 / verify pg_isready / ALTER USER ... PASSWORD"],
+    ["Sensor data >1 h stale", "Watcher not running, or SMB drive (Z:) unmounted", "Check Get-Process pythonw / Test-Path Z: / re-mount via net use"],
+    ["KNIME exit code 4", "GUI open with same workspace OR JVM module-access flags overridden", "Close KNIME GUI, do NOT pass -vmargs from CLI (use knime.ini for heap)"],
+    ["KNIME 'Attempt to overwrite password'", ".knwf was edited and lost the Variable to Credentials wiring", "Re-do the SETUP.md steps, re-export .knwf, re-deploy"],
+    ["Bronze disk growing unbounded", "KEEP_BRONZE=1 set in .env or aggressive cleanup disabled", "Unset KEEP_BRONZE; or run cleanup_bronze.py for retention pass"],
+    ["Gold tables empty after install", "Silver bootstrap was skipped or interrupted", "python -m etl.silver_to_gold.populate_gold from install dir"],
+    ["Power BI 'Cannot connect'", ".pbix has stale host/port/password baked in", "Re-run scripts/configure_bi_knime.py and refresh .pbix"],
+    ["JVM OOM on Motion workflow", "Default Xmx too high for VM, or page file too small", "Edit knime.ini -Xmx line; increase Windows virtual memory"],
+  ],
+  [2800, 2800, 3760],
+));
+
+main.push(para([new PageBreak()]));
+
+// ============= 15. MAINTENANCE =============
+main.push(h1("15 · Maintenance"));
+main.push(p("The pipeline is largely self-maintaining; this is a maintainer's runbook for the once-a-month-if-ever tasks."));
+
+main.push(h2("15.1 Daily check (30 seconds)"));
+main.push(p("Open the admin dashboard. Healthy state = green database + green watcher + 6 green freshness tiles + every gold fact >0 rows."));
+
+main.push(h2("15.2 Weekly check (5 minutes)"));
+main.push(bullet("Bronze disk usage — should hover around 1-2 GB if aggressive cleanup is on; growing unbounded means cleanup is broken"));
+main.push(bullet("Watcher uptime — Task Manager → pythonw.exe with watcher.py in the command line"));
+main.push(bullet("storage/admin_logs/ — review any non-empty error logs"));
+main.push(bullet("gold.fact_prediction_motion MAX(prediction_made_at) — should be within 24 hours"));
+
+main.push(h2("15.3 Monthly maintenance (optional)"));
+main.push(bullet("Postgres VACUUM ANALYZE silver.sensor_events / gold.fact_environment_minute — Postgres autovacuum usually keeps up; force once a month doesn't hurt"));
+main.push(bullet("Disk-usage queries: SELECT pg_size_pretty(pg_database_size('domotic_tests'))"));
+main.push(bullet("Re-run KNIME predictions if the workflow .knwf has been edited"));
+
+main.push(h2("15.4 Adding a new apartment"));
+main.push(numbered("School DB admin adds a row to MySQL apartment table"));
+main.push(numbered("Wait for next gold ETL pass (or click \"Run gold ETL (sensors)\" in admin pane) — pulls the new row into gold.dim_apartment"));
+main.push(numbered("Open .pbix in Power BI Desktop → Modeling → Manage roles → Create. Name e.g. \"Apartment3\", filter [apartment_key] = 3, save. RLS roles must be added manually — Power BI tooling has no programmatic API"));
+main.push(numbered("Verify: Modeling → View as → Apartment3 → confirm only the new apartment's data shows"));
+
+main.push(h2("15.5 Rotating the DB password"));
+main.push(p("Change Postgres password:"));
+main.push(...codeBlock([
+  "ALTER USER domotic PASSWORD '<new pwd>';",
+]));
+main.push(p("Update .env DB_URL with the new password. Restart the watcher and any running streamlit. KNIME picks up the new password automatically (read from .env at runtime). Re-run scripts/configure_bi_knime.py to patch the .pbix."));
+
+main.push(para([new PageBreak()]));
+
+// ============= 16. GDPR & ETHICS =============
+main.push(h1("16 · GDPR & ethics"));
+
+main.push(h2("16.1 Personal data inventory"));
+main.push(tbl(
+  ["Data point", "Source", "GDPR status", "Treatment"],
+  [
+    ["First name (occupant)",       "MySQL.buildings.firstName",  "Not personal data alone (Art. 4(1))",                        "Kept for usability"],
+    ["Last name",                   "MySQL.buildings.lastName",   "Personal data",                                              "Anonymised — not exposed in gold"],
+    ["Email / phone",               "MySQL.buildings",             "Personal data",                                              "Not imported"],
+    ["Building name",               "MySQL.buildings.houseName",   "Quasi-identifier",                                           "Replaced with \"Building <id>\" in gold"],
+    ["Apartment key (surrogate)",   "Generated",                   "Pseudonym (Art. 4(5))",                                      "Kept; only re-identifier in fact tables"],
+    ["GPS coordinates",             "MySQL.buildings.lat/lng",     "Personal data (precise location)",                           "Not imported"],
+    ["Postal address",              "MySQL.buildings.address/npa", "Personal data",                                              "Not imported"],
+    ["Sensor readings",             "JSON files",                  "Personal data when linkable to identified person",          "Aggregated to room-minute facts; tenant sees only own via RLS"],
+  ],
+  [2400, 2400, 2400, 2160],
+));
+
+main.push(h2("16.2 Lawful basis"));
+main.push(p("For the academic deployment, processing is justified under Art. 6(1)(a) (consent — the school provides the data to the project as part of registered student work) and Art. 6(1)(f) (legitimate interest — analysing one's own apartment's data)."));
+
+main.push(h2("16.3 Data subject rights"));
+main.push(bullet("Right of access (Art. 15) — RLS gives each tenant access to their own data only via Power BI"));
+main.push(bullet("Right to erasure (Art. 17) — DELETE FROM gold.dim_apartment WHERE apartment_id = '...' cascades through apartment_key FKs in all fact tables"));
+main.push(bullet("Right to data portability (Art. 20) — silver tables can be exported as CSV/parquet on request"));
+
+main.push(h2("16.4 Risk assessment"));
+main.push(callout("Residual risk",
+  "A determined attacker with side knowledge (e.g. who knows that Jimmy lives on the second floor of building X) could re-identify a tenant from the dashboards. For an academic demo with two consenting subjects, this is acceptable. A production rollout to >10 tenants would require pseudonymising first names too and a formal DPIA.",
+  ORANGE));
+
+main.push(para([new PageBreak()]));
+
+// ============= 17. SCALABILITY =============
+main.push(h1("17 · Scalability"));
+
+main.push(h2("17.1 Current limits (single-VM deployment)"));
+main.push(tbl(
+  ["Component", "Threshold", "Symptom", "Mitigation"],
+  [
+    ["Single PostgreSQL node", "~50-100 apartments", "INSERT throughput drops, query plans degrade", "Native partitioning by date_key + tune work_mem / shared_buffers"],
+    ["Single bronze disk", "Months of accumulation on one VM disk", "Disk fills, slow scans", "cleanup_bronze.py keeps it bounded; long-term move to S3-compatible blob"],
+    ["Watcher (single process)", "~500 files/min", "Falls behind on the 1-min loop", "Watcher per apartment cluster, or move to Kafka/Redis Streams"],
+    ["Power BI Direct Query", "Many concurrent users", "Slow refreshes, dashboard timeouts", "Switch to Import + scheduled refresh; consider Power BI Premium / read replica"],
+    ["MySQL source DB", "Polling many tables", "Read load on school DB", "CDC (Debezium) or batch sync at off-peak"],
+  ],
+  [2800, 1800, 2800, 1960],
+));
+
+main.push(h2("17.2 Bronze lifecycle"));
+main.push(p("On a single-VM deployment without object storage, bronze accumulates roughly 5 GB per apartment per year. cleanup_bronze.py is the pragmatic mitigation:"));
+main.push(numbered("Reads silver watermarks (silver.etl_watermark, silver.weather_watermark) — same tables the ETL uses to skip already-processed files."));
+main.push(numbered("For each filename in the watermarks where processed_at is older than BRONZE_RETENTION_DAYS (default 30, configurable in .env), deletes the bronze file."));
+main.push(numbered("Cleans up empty folders left behind."));
+main.push(numbered("Set BRONZE_RETENTION_DAYS=-1 to disable cleanup entirely (keep bronze forever)."));
+main.push(callout("Trade-off",
+  "Bronze becomes a bounded buffer (last N days) instead of an immutable archive. You lose the ability to re-derive silver from bronze for files older than the retention window. The original source data (SMB share, sFTP server, MySQL) is still available for full reprocessing.",
+  ORANGE));
+
+main.push(h2("17.3 Recommended evolution path"));
+main.push(numbered("0-1 year — current single-VM setup, scales to 5-10 apartments easily"));
+main.push(numbered("1-3 years — split watcher per apartment cluster, move bronze to blob storage (e.g. MinIO on-prem)"));
+main.push(numbered("3+ years — Kafka or similar between sources and silver, partitioned PG tables, read replica for BI"));
+
+main.push(para([new PageBreak()]));
+
+// ============= 18. PROJECT LAYOUT =============
+main.push(h1("18 · Project layout"));
 main.push(p("Top-level directories of the data-cycle-domotic repository:"));
 main.push(...codeBlock([
   "data-cycle-domotic/",
@@ -653,8 +959,21 @@ const doc = new Document({
 });
 
 // ============= WRITE =============
-const out = "docs/v2/out/DataCycle_Technical_Documentation.docx";
+const primary = "docs/v2/out/DataCycle_Technical_Documentation.docx";
 Packer.toBuffer(doc).then(buf => {
-  fs.writeFileSync(out, buf);
-  console.log(`✓ Wrote ${out} (${(buf.length / 1024).toFixed(0)} KB)`);
+  let target = primary;
+  try {
+    fs.writeFileSync(primary, buf);
+  } catch (e) {
+    if (e.code === "EBUSY" || e.code === "EPERM") {
+      // File open in Word — fall back to a timestamped sibling so we don't crash
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 16);
+      target = primary.replace(".docx", `_${stamp}.docx`);
+      fs.writeFileSync(target, buf);
+      console.warn(`⚠ Primary file was locked; wrote ${target} instead. Close Word and re-run to overwrite the original.`);
+    } else {
+      throw e;
+    }
+  }
+  console.log(`✓ Wrote ${target} (${(buf.length / 1024).toFixed(0)} KB)`);
 });
