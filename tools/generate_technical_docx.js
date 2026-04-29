@@ -165,6 +165,8 @@ sections.push({
 // ============= MAIN DOC =============
 const main = [];
 
+// (AI Tools Usage section is appended at the end of the document, see below.)
+
 main.push(h1("Executive summary"));
 main.push(p("DataCycle Domotic is an end-to-end data platform that ingests sensor readings from two smart apartments (~2 880 JSON files per day), MySQL apartment metadata, and daily weather forecasts via sFTP, then transforms them through a three-layer medallion architecture (bronze, silver, gold) on PostgreSQL 17. Two KNIME workflows produce ML-based motion and consumption forecasts. Power BI dashboards expose per-apartment views via Row-Level Security, and a Streamlit admin pane provides operators with one-click pipeline control."));
 main.push(p("The system runs entirely on a single Windows VM, with no cloud dependencies. Deployment is automated through a web wizard that generates a single self-contained Python installer the user runs once. After install, a continuous Python watcher schedules every layer (bronze→silver every minute, gold every 15 minutes, ML batch + cleanup daily at 06:30) without external orchestration tools."));
@@ -875,6 +877,39 @@ main.push(...codeBlock([
   "├── website/                       # git submodule, the install wizard",
   "└── docs/",
 ]));
+
+main.push(para([new PageBreak()]));
+
+// ============= 19. AI TOOLS USAGE =============
+main.push(h1("19 · AI Tools Usage"));
+main.push(p("Generative AI was used as a drafting and pair-programming aid during the project. No AI tool is considered an author. All architecture decisions, KNIME workflow design, Power BI dashboards (including Row-Level Security), VM deployment, and end-to-end testing were performed by the author."));
+
+main.push(h2("19.1 Tools Used"));
+main.push(tbl(
+  ["AI Tool", "Provider"],
+  [
+    ["Claude Sonnet 4.6 (via Claude Code CLI)", "Anthropic"],
+  ],
+  [4680, 4680],
+));
+
+main.push(h2("19.2 Scope of Assistance"));
+main.push(tbl(
+  ["Area", "How AI Was Used"],
+  [
+    ["Documentation",      "Drafted sections from the author's notes; edited by the author"],
+    ["Python boilerplate", "Initial drafts for ETL scripts, watcher loop, admin pane scaffolding"],
+    ["Debugging",          "Suggested fixes during the KNIME credential-injection investigation"],
+    ["Language",           "Grammar and consistency passes"],
+  ],
+  [3000, 6360],
+));
+
+main.push(h2("19.3 Manual Verification"));
+main.push(p("Every script was executed on the project VM and verified against expected outputs. The 79 359 ML prediction rows in gold.fact_prediction_* (66 186 consumption + 13 173 motion), the working install wizard, and the live KNIME workflows are direct evidence of the author's testing and integration work."));
+
+main.push(h2("19.4 Accountability Statement"));
+main.push(p("The author retains full responsibility for the content of this report and for the design, implementation, and validation of the DataCycle Domotic platform. AI tools were used exclusively as support; all AI-assisted outputs were reviewed, corrected, and edited where necessary."));
 
 main.push(para([new PageBreak()]));
 main.push(p("— end of document —", { alignment: AlignmentType.CENTER }));
