@@ -165,7 +165,91 @@ REPLACEMENTS = [
     # "...measurement was [truncated] produced." sentence
     ("captured. produced.", "captured."),
     ("captured.produced.",  "captured."),
+
+    # ── Bronze compression detail (slide 7 closing) ─────────────────────────
+    ("Bronze is the traceability and safety net of the pipeline — every other layer can be rebuilt from it.",
+     "After silver ingests a file, bronze gzips it in place — disk drops ~10-15× while the audit trail stays intact. Every other layer can be rebuilt from bronze."),
+
+    # ── Performance note on Silver hop (slide 8 — adds context to step 04) ──
+    ("Insert clean records into relational database tables ready for querying and joining.",
+     "Bulk-load via COPY into a temp table + single INSERT ... ON CONFLICT (50-150× faster than per-row INSERT)."),
 ]
+
+
+# ── Speaker notes for slides 7-13 ────────────────────────────────────────────
+# ~50 seconds of talking per slide ≈ 100-130 words. Covers the slide content
+# + adds context the audience can't read on the slide.
+SPEAKER_NOTES = {
+    7: (
+        "Bronze is where everything starts. Every minute, two JSON files land "
+        "on the SMB share — one per apartment. Every day, a CSV lands on the "
+        "sFTP for weather. We copy them into bronze partitioned by year, "
+        "month, day, hour. Bronze never modifies the data — that's the whole "
+        "point: if we ever lose silver or change the cleaning logic, we can "
+        "rebuild from bronze without touching the source systems. "
+        "After silver successfully ingests a file, we gzip the bronze copy "
+        "in place — roughly 10 to 15 times smaller, audit trail intact. "
+        "Bronze is the safety net for the entire pipeline."
+    ),
+    8: (
+        "Silver is the heaviest hop. A full backfill processes around "
+        "220 000 files. Eight worker processes parse JSON in parallel, "
+        "then we hit Postgres with the result. The interesting bit is the "
+        "upsert: instead of inserting row by row, we COPY everything into a "
+        "temp table and merge with one INSERT … ON CONFLICT statement. "
+        "That's a 50 to 150 times speedup — a 3-hour backfill drops to "
+        "10 minutes. Without that change, the install for dummies wouldn't "
+        "exist; nobody waits 3 hours for a setup script."
+    ),
+    9: (
+        "Silver mirrors the source systems but cleaned. Six entities: "
+        "apartments, rooms, devices, sensor events in long format, "
+        "weather observations, and time references. Joins between "
+        "sensors, rooms and apartments are now possible — that wasn't "
+        "true at the bronze layer. Silver is reliable but not yet "
+        "analytical: it's the foundation Gold is built on."
+    ),
+    10: (
+        "Gold is where silver becomes business-ready. Star schema — "
+        "dimensions for context, fact tables for measurements. The "
+        "design is dictated by what Power BI and KNIME need: "
+        "pre-aggregated, denormalised, fast. "
+        "Silver answers \"what happened?\". Gold answers \"so what?\"."
+    ),
+    11: (
+        "Four core dimensions on the slide. Time at minute granularity — "
+        "filterable by hour, day, week, month, weekday. Apartment with "
+        "anonymisation built in: building names replaced with \"Building 1\", "
+        "user IDs nulled, only first names kept (more on that in the GDPR "
+        "section). Room with its parent apartment — gives us room-level "
+        "granularity in every fact table. Device linked to its room. "
+        "Two more dimensions exist behind the scenes — dim_tariff for cost "
+        "projections, dim_weather_site for weather joins. Together they "
+        "give every numerical measurement business meaning."
+    ),
+    12: (
+        "Five fact tables, one per analytical domain. Energy in watts and "
+        "kilowatt-hours per device per minute. Environment with "
+        "temperature, CO₂, noise, pressure per room per minute. "
+        "Presence with motion, door, window flags — feeds the occupancy "
+        "ML model. Device health daily: uptime, error counts, battery. "
+        "And predictions — currently 66 thousand consumption forecasts "
+        "and 13 thousand motion forecasts produced by the KNIME workflows. "
+        "Splitting facts by domain keeps queries simple and the model "
+        "easy to extend."
+    ),
+    13: (
+        "This is where the data model becomes business value. "
+        "Descriptive analytics on the left — average consumption, peak "
+        "times, room-by-room comparisons, occupancy patterns, "
+        "environmental quality, device reliability. Predictive on the "
+        "right — forecasted consumption and occupancy with side-by-side "
+        "comparison to actual values. Each KPI on this slide is one "
+        "query: a fact table joined with the dimensions we just saw. "
+        "Sacha will walk through the Power BI dashboards next, then "
+        "the ML workflows that produce those predictions."
+    ),
+}
 
 
 def replace_in_text_frame(tf, old, new):
@@ -218,7 +302,16 @@ def main():
             print(f"  Slide {slide_idx:2d}: {slide_replacements} replacement(s)")
         total_replacements += slide_replacements
 
+        # Set/replace speaker notes for this slide (notes pane in PowerPoint)
+        notes_text = SPEAKER_NOTES.get(slide_idx)
+        if notes_text:
+            notes_slide = slide.notes_slide
+            tf = notes_slide.notes_text_frame
+            tf.clear()
+            tf.text = notes_text
+
     print(f"\n{total_replacements} text replacement(s) applied to slides 7-13.")
+    print(f"{len(SPEAKER_NOTES)} speaker-notes blocks written.")
     p.save(OUTPUT_PATH)
     size_kb = OUTPUT_PATH.stat().st_size / 1024
     print(f"\n✓ Wrote {OUTPUT_PATH} ({size_kb:.0f} KB)")
