@@ -88,6 +88,14 @@ def bronze_dest(apartment, ts, filename):
     return folder / filename
 
 
+def bronze_already_present(apartment, ts, filename):
+    """True if either the raw .json or its compressed .json.gz exists in
+    bronze for this filename. Used to avoid re-copying files we already
+    have (in either form)."""
+    folder = BRONZE_ROOT / apartment / ts.strftime("%Y") / ts.strftime("%m") / ts.strftime("%d") / ts.strftime("%H")
+    return (folder / filename).exists() or (folder / (filename + ".gz")).exists()
+
+
 def copy_file(src, dst):
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -148,7 +156,8 @@ def find_new_files_predict(after_filename):
                         found_this_minute = True
                         continue
                     dst = bronze_dest(apt_local, current_dt, filename)
-                    if not dst.exists():
+                    # Check both raw and compressed (.json + .json.gz)
+                    if not bronze_already_present(apt_local, current_dt, filename):
                         new_files.append((smb_file, dst))
                 found_this_minute = True
 
@@ -200,7 +209,8 @@ def find_new_files_full():
         dst = BRONZE_ROOT / apt / ts.strftime("%Y") / ts.strftime("%m") / ts.strftime("%d") / ts.strftime("%H") / name
         src = SMB_PATH / name
 
-        if dst.exists():
+        # Skip if either raw or compressed copy exists in bronze
+        if dst.exists() or dst.with_suffix(dst.suffix + ".gz").exists():
             consecutive_existing += 1
             if consecutive_existing >= 50:
                 break

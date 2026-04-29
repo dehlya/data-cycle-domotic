@@ -253,7 +253,7 @@ main.push(bullet("Discovery: full rglob over each apartment's bronze tree, diff 
 main.push(bullet("Parallel parsing: ProcessPoolExecutor(max_workers=8), each worker takes a batch of 2 000 files, parses JSON, normalises room names, applies outlier bounds (e.g., temperature_c ∈ [-20, 60]), returns rows."));
 main.push(bullet("Bulk upsert: psycopg2.copy_expert into a TEMP TABLE _tmp_sensor_events, then INSERT INTO silver.sensor_events SELECT DISTINCT ON ... FROM _tmp_sensor_events ON CONFLICT (...) DO UPDATE. The DISTINCT ON dedupes within-batch."));
 main.push(bullet("Watermark: INSERT INTO silver.etl_watermark VALUES %s ON CONFLICT DO NOTHING via psycopg2.execute_values."));
-main.push(bullet("Aggressive bronze cleanup (default on; disable with KEEP_BRONZE=1): after the upsert + watermark commit, deletes the bronze JSONs and appends filenames to storage\\processed.log."));
+main.push(bullet("Bronze compression on success (default; disable with KEEP_BRONZE=1, hard-delete with DELETE_BRONZE=1): after the upsert + watermark commit, gzips the bronze JSON in place (file.json -> file.json.gz) and appends the filename to storage\\processed.log. Disk shrinks ~10-15x while the audit trail is preserved."));
 main.push(callout("Performance",
   "~30 k rows/second on the worker's main-thread upsert. ~220 k files × 60 events/file = ~13 M rows in 10–15 minutes on the project VM.",
   TEAL));
@@ -448,12 +448,12 @@ const adrs = [
     tradeoffs: "No web UI for DAGs (replaced by the Streamlit admin pane); no retry/SLA primitives (subprocess return codes + warning logs cover what we need); no DAG-level dependency expression (the watcher's three time triggers call functions in fixed order).",
   },
   {
-    id: "ADR 002", title: "Aggressive bronze cleanup (delete after silver insert)",
+    id: "ADR 002", title: "Bronze compression after silver insert (preserve audit trail, shrink disk)",
     date: "2026-04",
-    context: "The course's reference architecture (PDF chapter \"Architecture — Medaillon architecture\") describes the bronze layer as \"Stored incrementally, with all history.\" In our deployment, 2 apartments × 1 file/min × 365 days = 1 M JSON files/year/apt; ~10 KB per file → ~20 GB/year just for sensors. Bronze grows unbounded if we follow the reference exactly.",
-    decision: "Deviate from the reference: after every successful silver insert + watermark commit, delete the bronze JSONs from disk (default on; opt-out with KEEP_BRONZE=1). Filenames are appended to storage/processed.log so future SMB rescans do not re-copy them.",
-    rationale: "The original SMB share is the durable copy; bronze on the VM was always a staging area. Silver fully reconstructs the relevant data. The course-allocated VM has limited disk; bounded bronze is more important than the immutable-archive property.",
-    tradeoffs: "If silver gets corrupted or dropped, full re-fetch from SMB is the only recovery (slower but possible). Less obvious raw audit trail — partly compensated by silver.etl_watermark which records every filename that landed.",
+    context: "The course's reference architecture (PDF chapter \"Architecture — Medaillon architecture\") describes the bronze layer as \"Stored incrementally, with all history.\" In our deployment, 2 apartments × 1 file/min × 365 days = 1 M JSON files/year/apt; ~10 KB per file → ~200 GB/year just for sensors. Bronze grows unbounded if we follow the reference exactly. Hard-deleting bronze would solve the disk problem but breaks the audit-trail promise.",
+    decision: "After every successful silver insert + watermark commit, the bronze file is gzip-compressed in place: file.json becomes file.json.gz (default; opt-out via KEEP_BRONZE=1). Hard delete is still available behind DELETE_BRONZE=1 for hard-disk-tight VMs. Filenames are also appended to storage/processed.log so SMB rescans skip both forms.",
+    rationale: "Compression preserves the full audit-trail property of bronze (which the course's reference architecture and our own slides emphasise) while shrinking on-disk size by roughly 10-15× for typical sensor JSON. We get the best of both worlds: the disk stays bounded (~15 GB/year instead of ~200 GB/year), and any silver corruption can still be recovered by decompressing and re-running flatten_sensors. bulk_to_bronze.py was updated to recognise both .json and .json.gz when checking whether a file is already present, so the SMB → bronze step never re-fetches a compressed file.",
+    tradeoffs: "Silver still has to gunzip on the rare occasion it re-reads a compressed file (cheap). Compression adds a small CPU cost per batch (~1-2 s for 2 000 files at compresslevel=6). Anyone wanting raw uncompressed bronze for debugging sets KEEP_BRONZE=1; anyone wanting hard delete sets DELETE_BRONZE=1.",
   },
   {
     id: "ADR 003", title: "KNIME credential injection via Variable to Credentials",

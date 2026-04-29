@@ -21,11 +21,12 @@ BRONZE_ROOT = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
 DB_URL = os.getenv("DB_URL")
 WEATHER_MIN_YEAR = int(os.getenv("WEATHER_MIN_YEAR", "2023"))
 
-# Same aggressive-cleanup behavior as flatten_sensors.py: after a CSV is
-# successfully cleaned + upserted into silver + watermarked, delete it from
-# bronze. Set KEEP_BRONZE=1 to disable. Filenames go into processed.log so
-# future SMB rescans don't re-fetch them.
-DELETE_BRONZE_ON_SILVER = os.getenv("KEEP_BRONZE", "0") != "1"
+# Same bronze post-processing as flatten_sensors.py: by default COMPRESS the
+# CSV in place after silver ingestion (file.csv -> file.csv.gz). Set
+# KEEP_BRONZE=1 to keep raw uncompressed; set DELETE_BRONZE=1 to hard-delete
+# instead. Filenames go into processed.log so future scans skip them.
+COMPRESS_BRONZE_ON_SILVER = os.getenv("KEEP_BRONZE", "0") != "1" and os.getenv("DELETE_BRONZE", "0") != "1"
+DELETE_BRONZE_ON_SILVER   = os.getenv("DELETE_BRONZE", "0") == "1"
 PROCESSED_LOG = (BRONZE_ROOT.parent / "processed.log") if BRONZE_ROOT.is_absolute() \
     else (Path(__file__).resolve().parent.parent.parent / BRONZE_ROOT.parent / "processed.log")
 
@@ -288,19 +289,46 @@ def find_csv(watermark):
 WORKERS = int(os.getenv("CLEAN_WEATHER_WORKERS", "4"))
 
 
+def _append_processed_log(name: str) -> None:
+    try:
+        PROCESSED_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with PROCESSED_LOG.open("a", encoding="utf-8") as f:
+            f.write(name + "\n")
+    except Exception:
+        pass
+
+
+def _compress_bronze_csv(path: Path) -> None:
+    """Compress a bronze CSV in place (file.csv -> file.csv.gz, original
+    removed) after successful silver ingestion. Preserves the audit trail
+    while shrinking disk ~10-20x for typical weather CSVs."""
+    import gzip, shutil
+    try:
+        if not path.exists():
+            return
+        dst = path.with_suffix(path.suffix + ".gz")
+        with path.open("rb") as f_in, gzip.open(dst, "wb", compresslevel=6) as f_out:
+            shutil.copyfileobj(f_in, f_out)
+        path.unlink()
+    except Exception:
+        return
+    _append_processed_log(path.name)
+
+
 def _delete_bronze_csv(path: Path) -> None:
-    """Delete a bronze weather CSV that just made it into silver and append
-    its filename to processed.log so SMB rescans skip it. Best-effort."""
+    """Hard-delete a bronze CSV (only when DELETE_BRONZE=1)."""
     try:
         path.unlink(missing_ok=True)
     except Exception:
         return
-    try:
-        PROCESSED_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with PROCESSED_LOG.open("a", encoding="utf-8") as f:
-            f.write(path.name + "\n")
-    except Exception:
-        pass
+    _append_processed_log(path.name)
+
+
+def _post_silver(path: Path) -> None:
+    """Compress (default) or delete the bronze CSV after silver ingestion."""
+    if COMPRESS_BRONZE_ON_SILVER:
+        _compress_bronze_csv(path)
+    el_post_silver(path)
 
 
 def _process_one_file(path_str: str) -> tuple[str, int, str | None]:
@@ -319,8 +347,7 @@ def _process_one_file(path_str: str) -> tuple[str, int, str | None]:
                 mark_done(engine, path.name)
             finally:
                 engine.dispose()
-            if DELETE_BRONZE_ON_SILVER:
-                _delete_bronze_csv(path)
+            _post_silver(path)
             return (path.name, 0, "empty file")
 
         df_clean = clean_dataframe(df, prediction_date)
@@ -330,8 +357,7 @@ def _process_one_file(path_str: str) -> tuple[str, int, str | None]:
                 mark_done(engine, path.name)
             finally:
                 engine.dispose()
-            if DELETE_BRONZE_ON_SILVER:
-                _delete_bronze_csv(path)
+            _post_silver(path)
             return (path.name, 0, "no rows after cleaning")
 
         # Each worker gets its own engine

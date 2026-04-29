@@ -8,10 +8,12 @@ Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
 
 import csv
+import gzip
 import io
 import json
 import logging
 import os
+import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -30,11 +32,15 @@ WORKERS     = 8
 BATCH_SIZE  = 2000
 LOG_EVERY   = 1     # log after every batch — keeps the user reassured during long runs
 
-# After a batch is successfully inserted into silver + watermarked, delete the
-# bronze JSON files. This frees disk immediately rather than waiting for the
-# scheduled cleanup_bronze.py retention pass. Set KEEP_BRONZE=1 to disable
-# (e.g. for debugging or if you want to keep raw files around for a while).
-DELETE_BRONZE_ON_SILVER = os.getenv("KEEP_BRONZE", "0") != "1"
+# After a batch is successfully inserted into silver + watermarked, compress
+# the bronze JSON files in place (file.json -> file.json.gz). This preserves
+# the full audit trail (the whole point of having a bronze layer) while
+# shrinking disk usage 10-15x with gzip. Set KEEP_BRONZE=1 to keep raw
+# uncompressed files (e.g. for debugging). Set DELETE_BRONZE=1 to delete
+# instead of compress (only for hard-disk-tight VMs that don't need the
+# audit trail).
+COMPRESS_BRONZE_ON_SILVER = os.getenv("KEEP_BRONZE", "0") != "1" and os.getenv("DELETE_BRONZE", "0") != "1"
+DELETE_BRONZE_ON_SILVER   = os.getenv("DELETE_BRONZE", "0") == "1"
 
 # When we delete a file from bronze, we also append its filename to this log.
 # bulk_to_bronze.py reads this log on every scan and skips files listed here,
@@ -89,12 +95,54 @@ def mark_done(engine, filenames):
         raw.close()
 
 
-def delete_bronze_files(paths: list[str], filenames: list[str]):
-    """Delete bronze files that just made it into silver, then append their
-    filenames to processed.log so future SMB rescans don't re-copy them.
+def _append_processed_log(filenames: list[str]):
+    """Append filenames to processed.log so future SMB rescans + watermark
+    scans skip them. Best-effort."""
+    try:
+        PROCESSED_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with PROCESSED_LOG.open("a", encoding="utf-8") as f:
+            for name in filenames:
+                f.write(name + "\n")
+    except Exception as e:
+        log.warning(f"Could not append to {PROCESSED_LOG}: {e}")
 
-    Best-effort: never crashes the pipeline on a permission error or missing
-    file, just counts and warns.
+
+def compress_bronze_files(paths: list[str], filenames: list[str]):
+    """Compress bronze files in-place after silver ingestion (file.json
+    -> file.json.gz, original removed). Preserves the audit trail while
+    shrinking disk usage ~10-15x for typical sensor JSON payloads.
+
+    Best-effort: never crashes the pipeline on a permission error or
+    missing file, just counts and warns.
+    """
+    if not paths:
+        return 0, 0
+    compressed = 0
+    failed = 0
+    for p in paths:
+        try:
+            src = Path(p)
+            if not src.exists():
+                # Already processed in a previous run, skip silently
+                continue
+            dst = src.with_suffix(src.suffix + ".gz")
+            with src.open("rb") as f_in, gzip.open(dst, "wb", compresslevel=6) as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            src.unlink()
+            compressed += 1
+        except Exception:
+            failed += 1
+    _append_processed_log(filenames)
+    return compressed, failed
+
+
+def delete_bronze_files(paths: list[str], filenames: list[str]):
+    """Hard-delete bronze files that just made it into silver. Used only
+    when DELETE_BRONZE=1; the default path is compress_bronze_files()
+    instead, which keeps the audit trail.
+
+    Best-effort: never crashes the pipeline on a permission error or
+    missing file, just counts and warns.
     """
     if not paths:
         return 0, 0
@@ -106,14 +154,7 @@ def delete_bronze_files(paths: list[str], filenames: list[str]):
             deleted += 1
         except Exception:
             failed += 1
-    # Append filenames to processed.log
-    try:
-        PROCESSED_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with PROCESSED_LOG.open("a", encoding="utf-8") as f:
-            for name in filenames:
-                f.write(name + "\n")
-    except Exception as e:
-        log.warning(f"Could not append to {PROCESSED_LOG}: {e}")
+    _append_processed_log(filenames)
     return deleted, failed
 
 # -- SENSOR PARSING ------------------------------------------------------------
@@ -393,7 +434,7 @@ def run():
     log.info(f"Starting... first progress line will appear after the first batch finishes (~10-30s).")
 
     total_files = total_rows = total_errors = 0
-    total_deleted = 0
+    total_compressed = total_deleted = 0
     t_start = time.monotonic()
 
     with ProcessPoolExecutor(max_workers=WORKERS) as executor:
@@ -405,12 +446,19 @@ def run():
             total_files  += len(result["processed"])
             total_rows   += len(result["rows"])
             total_errors += result["errors"]
-            # Aggressive cleanup: delete bronze files now that silver has them
-            if DELETE_BRONZE_ON_SILVER:
-                deleted, failed = delete_bronze_files(
+            # Bronze post-processing: by default, COMPRESS in place to keep
+            # the audit trail while shrinking disk ~10-15x. Hard-delete only
+            # if DELETE_BRONZE=1 is explicitly set.
+            if COMPRESS_BRONZE_ON_SILVER:
+                done, failed = compress_bronze_files(
                     result["processed_paths"], result["processed"]
                 )
-                total_deleted += deleted
+                total_compressed += done
+            elif DELETE_BRONZE_ON_SILVER:
+                done, failed = delete_bronze_files(
+                    result["processed_paths"], result["processed"]
+                )
+                total_deleted += done
 
             if n % LOG_EVERY == 0 or n == len(batches):
                 elapsed   = time.monotonic() - t_start
