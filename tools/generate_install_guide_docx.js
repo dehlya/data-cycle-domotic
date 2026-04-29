@@ -334,8 +334,8 @@ main.push(para([new PageBreak()]));
 
 // ── AI Tools Usage (slim version, at the end) ──
 main.push(h1("AI Tools Usage"));
-main.push(p("Generative AI (Anthropic Claude Sonnet 4.6, via the Claude Code CLI) was used as a drafting aid for parts of this guide and for the installer template's Python code. No AI tool is considered an author. The installer flow, all credentials handling, and every screenshot in the appendix come from real installs performed by the author on the project VM."));
-main.push(p("The author retains full responsibility for the installer behavior and for the accuracy of this guide. All AI-assisted outputs were reviewed, corrected, and tested manually."));
+main.push(p("Generative AI (Anthropic Claude Sonnet 4.6, via the Claude Code CLI) was used as a drafting aid for parts of this guide, for the installer template's Python code, and for the wording of inline code comments and log messages emitted by the pipeline. No AI tool is considered an author. The installer flow, all credentials handling, and every screenshot in the appendix come from real installs performed by the authors on the project VM."));
+main.push(p("The authors retain full responsibility for the installer behavior and for the accuracy of this guide. All AI-assisted outputs were reviewed, corrected, and tested manually."));
 
 main.push(para([new PageBreak()]));
 main.push(p("— end of installation guide —", { alignment: AlignmentType.CENTER }));

@@ -882,7 +882,7 @@ main.push(para([new PageBreak()]));
 
 // ============= 19. AI TOOLS USAGE =============
 main.push(h1("19 · AI Tools Usage"));
-main.push(p("Generative AI was used as a drafting and pair-programming aid during the project. No AI tool is considered an author. All architecture decisions, KNIME workflow design, Power BI dashboards (including Row-Level Security), VM deployment, and end-to-end testing were performed by the author."));
+main.push(p("Generative AI was used as a drafting and pair-programming aid during the project. No AI tool is considered an author. All architecture decisions, KNIME workflow design, Power BI dashboards (including Row-Level Security), VM deployment, and end-to-end testing were performed by the authors."));
 
 main.push(h2("19.1 Tools Used"));
 main.push(tbl(
@@ -897,19 +897,21 @@ main.push(h2("19.2 Scope of Assistance"));
 main.push(tbl(
   ["Area", "How AI Was Used"],
   [
-    ["Documentation",      "Drafted sections from the author's notes; edited by the author"],
-    ["Python boilerplate", "Initial drafts for ETL scripts, watcher loop, admin pane scaffolding"],
-    ["Debugging",          "Suggested fixes during the KNIME credential-injection investigation"],
-    ["Language",           "Grammar and consistency passes"],
+    ["Documentation",       "Drafted sections from the authors' notes; edited by the authors"],
+    ["Python boilerplate",  "Initial drafts for ETL scripts, watcher loop, admin pane scaffolding"],
+    ["Inline code comments", "Drafted docstrings and explanatory comments inside the scripts"],
+    ["Log messages",         "Wording of progress lines, warnings, and error messages emitted by the pipeline"],
+    ["Debugging",           "Suggested fixes during the KNIME credential-injection investigation"],
+    ["Language",            "Grammar and consistency passes"],
   ],
   [3000, 6360],
 ));
 
 main.push(h2("19.3 Manual Verification"));
-main.push(p("Every script was executed on the project VM and verified against expected outputs. The 79 359 ML prediction rows in gold.fact_prediction_* (66 186 consumption + 13 173 motion), the working install wizard, and the live KNIME workflows are direct evidence of the author's testing and integration work."));
+main.push(p("Every script was executed on the project VM and verified against expected outputs. The 79 359 ML prediction rows in gold.fact_prediction_* (66 186 consumption + 13 173 motion), the working install wizard, and the live KNIME workflows are direct evidence of the authors' testing and integration work."));
 
 main.push(h2("19.4 Accountability Statement"));
-main.push(p("The author retains full responsibility for the content of this report and for the design, implementation, and validation of the DataCycle Domotic platform. AI tools were used exclusively as support; all AI-assisted outputs were reviewed, corrected, and edited where necessary."));
+main.push(p("The authors retain full responsibility for the content of this report and for the design, implementation, and validation of the DataCycle Domotic platform. AI tools were used exclusively as support; all AI-assisted outputs were reviewed, corrected, and edited where necessary."));
 
 main.push(para([new PageBreak()]));
 main.push(p("— end of document —", { alignment: AlignmentType.CENTER }));
