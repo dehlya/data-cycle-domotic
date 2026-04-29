@@ -79,7 +79,9 @@ CREATE TABLE IF NOT EXISTS silver.apartment_metadata (
 );
 
 -- DI ERRORS
--- TODO: populate from MySQL DIErrors table (blocked on schema confirmation)
+-- Populated by transform_di_errors() in import_mysql_to_silver.py from the
+-- raw MySQL DIErrors dump in silver.log_sensor_errors. Joined into
+-- gold.fact_device_health_day by populate_sensors.py.
 CREATE TABLE IF NOT EXISTS silver.di_errors_clean (
     id            BIGSERIAL PRIMARY KEY,
     error_id      INTEGER,
