@@ -173,6 +173,11 @@ REPLACEMENTS = [
     # ── Performance note on Silver hop (slide 8 — adds context to step 04) ──
     ("Insert clean records into relational database tables ready for querying and joining.",
      "Bulk-load via COPY into a temp table + single INSERT ... ON CONFLICT (50-150× faster than per-row INSERT)."),
+
+    # ── Slide 9: Time References doesn't exist in silver. Fix to a real entity ──
+    # silver.di_errors_clean is populated from MySQL DIErrors and joined into
+    # gold.fact_device_health_day. Calling it "Time References" was misleading.
+    ("Time References", "Sensor Error Logs"),
 ]
 
 
@@ -203,11 +208,13 @@ SPEAKER_NOTES = {
     ),
     9: (
         "Silver mirrors the source systems but cleaned. Six entities: "
-        "apartments, rooms, devices, sensor events in long format, "
-        "weather observations, and time references. Joins between "
-        "sensors, rooms and apartments are now possible — that wasn't "
-        "true at the bronze layer. Silver is reliable but not yet "
-        "analytical: it's the foundation Gold is built on."
+        "apartments, rooms, devices imported from the school's MySQL, "
+        "sensor events in long format from the JSON files, weather "
+        "observations from the sFTP CSVs, and sensor error logs joined "
+        "from the MySQL DIErrors table. Joins between sensors, rooms "
+        "and apartments are now possible — that wasn't true at bronze. "
+        "Silver is reliable but not yet analytical: it's the foundation "
+        "Gold is built on."
     ),
     10: (
         "Gold is where silver becomes business-ready. Star schema — "
@@ -218,23 +225,27 @@ SPEAKER_NOTES = {
     ),
     11: (
         "Four core dimensions on the slide. Time at minute granularity — "
-        "filterable by hour, day, week, month, weekday. Apartment with "
-        "anonymisation built in: building names replaced with \"Building 1\", "
-        "user IDs nulled, only first names kept (more on that in the GDPR "
-        "section). Room with its parent apartment — gives us room-level "
-        "granularity in every fact table. Device linked to its room. "
-        "Two more dimensions exist behind the scenes — dim_tariff for cost "
-        "projections, dim_weather_site for weather joins. Together they "
-        "give every numerical measurement business meaning."
+        "filterable by hour, day, week, month, weekday — plus a "
+        "companion date-only dim_date for daily aggregations. Apartment "
+        "with anonymisation built in: building names replaced with "
+        "\"Building 1\", user IDs nulled, only first names kept (more "
+        "on that in the GDPR section). Room with its parent apartment — "
+        "gives us room-level granularity in every fact table. Device "
+        "linked to its room. Two more dimensions exist behind the scenes "
+        "— dim_tariff for cost projections from kWh, and dim_weather_site "
+        "for joining outdoor weather to the consumption-prediction model. "
+        "Together they give every numerical measurement business meaning."
     ),
     12: (
-        "Five fact tables, one per analytical domain. Energy in watts and "
-        "kilowatt-hours per device per minute. Environment with "
-        "temperature, CO₂, noise, pressure per room per minute. "
-        "Presence with motion, door, window flags — feeds the occupancy "
-        "ML model. Device health daily: uptime, error counts, battery. "
-        "And predictions — currently 66 thousand consumption forecasts "
-        "and 13 thousand motion forecasts produced by the KNIME workflows. "
+        "Five domain-specific fact tables shown here. Energy: power and "
+        "kilowatt-hours per device per minute. Environment: indoor "
+        "temperature, CO₂, noise, pressure per room per minute — distinct "
+        "from outdoor weather, which lives in a separate fact_weather_hour "
+        "we use to feed the consumption-prediction model. Presence: "
+        "motion, door, window flags per room per minute — feeds the "
+        "occupancy ML model. Device health daily: uptime, error counts, "
+        "battery. Predictions: 66 thousand consumption forecasts and "
+        "13 thousand motion forecasts produced by the KNIME workflows. "
         "Splitting facts by domain keeps queries simple and the model "
         "easy to extend."
     ),
