@@ -155,6 +155,12 @@ def run_pipeline():
         ("flatten_sensors", PROJECT_ROOT / "etl" / "bronze_to_silver" / "flatten_sensors.py", "Bronze -> Silver"),
     ]
 
+    # No subprocess timeout for the silver pipeline.
+    # The original 2-hour cap was meant to catch hangs in the continuous
+    # 1-minute loop, but it also killed legitimate first-time backfills
+    # that legitimately take 2-4 hours (e.g. flatten_sensors at ~400 k
+    # files hitting the unique-index slowdown). The watermark + idempotent
+    # design means a re-run resumes safely if the user does Ctrl+C anyway.
     for name, script, desc in steps:
         if not script.exists():
             print(f"  {RE}x {name} -- script not found: {script}{R}")
@@ -165,14 +171,11 @@ def run_pipeline():
             result = subprocess.run(
                 [sys.executable, "-u", str(script)],
                 cwd=str(PROJECT_ROOT),
-                timeout=7200,
             )
             if result.returncode == 0:
                 print(f"  {GR}v{R} {name} done\n")
             else:
                 print(f"  {RE}x {name} exited with code {result.returncode}{R}\n")
-        except subprocess.TimeoutExpired:
-            print(f"  {RE}x {name} timed out (2h){R}\n")
         except Exception as e:
             print(f"  {RE}x {name} error: {e}{R}\n")
 

@@ -29,7 +29,7 @@ BRONZE_ROOT = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
 DB_URL      = os.getenv("DB_URL")
 APARTMENTS  = ["jimmy", "jeremie"]
 WORKERS     = 8
-BATCH_SIZE  = 2000
+BATCH_SIZE  = 5000  # bigger batches = fewer round-trips + better COPY amortisation
 LOG_EVERY   = 1     # log after every batch — keeps the user reassured during long runs
 
 # After a batch is successfully inserted into silver + watermarked, compress
