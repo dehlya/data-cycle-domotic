@@ -37,3 +37,4 @@ Thumbs.db
 hs_err_*.mdmp
 hs_err_*.log
 _personal/
+knime-test.log
