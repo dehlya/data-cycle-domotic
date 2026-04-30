@@ -1126,9 +1126,10 @@ Flags:
     print(f"{DIM}Install log saved to install.log{RESET}")
     print()
 
-    # Interactive: auto-open Power BI + KNIME + start watcher + admin dashboard
-    maybe_open_powerbi(install_path)
+    # Interactive: KNIME first (memory-hungry, run before Power BI eats RAM),
+    # then Power BI, then watcher, then admin dashboard.
     maybe_run_predictions(venv, install_path)
+    maybe_open_powerbi(install_path)
     maybe_start_watcher(venv, install_path)
     maybe_launch_admin(venv, install_path)
 
