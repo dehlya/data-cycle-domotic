@@ -493,13 +493,53 @@ def venv_python(venv: Path) -> Path:
 
 
 def install_deps(venv: Path, install_dir: Path):
+    """Install / update requirements.txt into the venv. Idempotent — pip
+    skips already-installed packages and only installs what's missing or
+    out-of-date. Always runs (unless --skip-deps), so re-running the
+    installer after we add a new dep (e.g. matplotlib for Power BI Python
+    visuals) automatically catches it up."""
     py = venv_python(venv)
     req = install_dir / "requirements.txt"
     if not req.exists():
         die(f"requirements.txt not found at {req}")
+    print(f"  {DIM}Checking for missing or outdated packages…{RESET}")
     subprocess.run([str(py), "-m", "pip", "install", "--upgrade", "pip", "--quiet"], check=True)
     subprocess.run([str(py), "-m", "pip", "install", "-r", str(req), "--quiet"], check=True)
-    ok("Python dependencies installed")
+    ok("Python dependencies up to date")
+
+
+def configure_pbi_python(install_dir: Path) -> bool:
+    """Point Power BI Desktop's Python visual interpreter at this install's
+    venv. PBI uses whatever Python is set under
+    HKCU\\SOFTWARE\\Microsoft\\Microsoft Power BI Desktop\\PythonScriptOptions
+    when rendering Python visuals inside .pbix files.
+
+    Without this, the customer hits a 'No module named matplotlib' error
+    the first time a Python visual tries to render — even though we ship
+    matplotlib in requirements.txt — because PBI is pointing at some
+    unrelated system Python by default.
+
+    Idempotent. Windows-only (no-op elsewhere). Best-effort: if the
+    registry write fails (e.g. PBI never run yet), we just warn.
+    """
+    if os.name != "nt":
+        return False
+    venv_scripts = install_dir / ".venv" / "Scripts"
+    if not (venv_scripts / "python.exe").exists():
+        warn("venv Python not found — skipping Power BI Python config.")
+        return False
+    try:
+        import winreg
+        key_path = r"SOFTWARE\Microsoft\Microsoft Power BI Desktop\PythonScriptOptions"
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as k:
+            winreg.SetValueEx(k, "PythonHome",       0, winreg.REG_SZ,    str(venv_scripts))
+            winreg.SetValueEx(k, "PythonOverridden", 0, winreg.REG_DWORD, 1)
+        ok(f"Power BI Python interpreter -> {venv_scripts}")
+        return True
+    except Exception as e:
+        warn(f"Could not configure Power BI Python interpreter: {e}")
+        warn("  (Power BI Desktop must be installed first; safe to re-run later.)")
+        return False
 
 
 def run_script(venv: Path, install_dir: Path, *args, label=None, env_extra=None):
@@ -1129,6 +1169,10 @@ Flags:
     # Interactive: KNIME first (memory-hungry, run before Power BI eats RAM),
     # then Power BI, then watcher, then admin dashboard.
     maybe_run_predictions(venv, install_path)
+    # Make Power BI's Python visual interpreter point at our venv (where
+    # matplotlib + pandas are installed) BEFORE we open the .pbix, so the
+    # very first refresh inside PBI works without a missing-module error.
+    configure_pbi_python(install_path)
     maybe_open_powerbi(install_path)
     maybe_start_watcher(venv, install_path)
     maybe_launch_admin(venv, install_path)

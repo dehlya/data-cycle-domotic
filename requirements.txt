@@ -15,6 +15,11 @@ scikit-learn==1.3.2
 statsmodels==0.14.1
 numpy==1.26.2
 
+# Power BI Python visuals (PBI Desktop runs Python scripts inside .pbix
+# visuals; PBI is auto-pointed at this venv by the installer, so anything
+# the .pbix's Python visuals import must be available here.)
+matplotlib==3.8.2
+
 # Admin UI
 streamlit==1.32.2
 
