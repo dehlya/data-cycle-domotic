@@ -16,6 +16,7 @@ Then open http://localhost:8501 in any browser.
 Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
 
+import json
 import os
 import re
 import subprocess
@@ -130,6 +131,68 @@ def check_running_job():
     return job
 
 
+# ── ADMIN STATE (persisted across reloads) ────────────────────────────────────
+ADMIN_STATE_PATH = PROJECT_ROOT / "storage" / "admin_state.json"
+
+def _load_admin_state() -> dict:
+    """Read the small JSON state file (PBI configured, etc). Returns {} if
+    missing or unreadable — fail-soft, the wizard will just show again."""
+    try:
+        return json.loads(ADMIN_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_admin_state(state: dict) -> None:
+    ADMIN_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ADMIN_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+# ── POWER BI WIZARD HELPERS ───────────────────────────────────────────────────
+def _find_pbix() -> Path | None:
+    """Locate the project's .pbix file. Tries the standard install location
+    first, then falls back to a glob under bi/."""
+    for candidate in [
+        PROJECT_ROOT / "bi" / "power_bi" / "DataCycleDomotic.pbix",
+        PROJECT_ROOT / "bi" / "DataCycleDomotic.pbix",
+    ]:
+        if candidate.exists():
+            return candidate
+    bi_root = PROJECT_ROOT / "bi"
+    if bi_root.exists():
+        matches = sorted(bi_root.rglob("*.pbix"))
+        if matches:
+            return matches[0]
+    return None
+
+def _find_pbi_exe() -> Path | None:
+    """Find Power BI Desktop on Windows. Returns None on non-Windows or if
+    PBI Desktop isn't installed — caller should fall back to os.startfile."""
+    if os.name != "nt":
+        return None
+    for candidate in [
+        Path(r"C:\Program Files\Microsoft Power BI Desktop\bin\PBIDesktop.exe"),
+        Path(r"C:\Program Files (x86)\Microsoft Power BI Desktop\bin\PBIDesktop.exe"),
+    ]:
+        if candidate.exists():
+            return candidate
+    return None
+
+def _open_pbix(pbix: Path, pbi_exe: Path | None) -> str:
+    """Launch the .pbix in Power BI Desktop. Prefer the detected exe so
+    we don't trigger the Windows 'choose an app' dialog when the .pbix
+    extension isn't associated. Returns 'ok' or an error message."""
+    try:
+        if pbi_exe:
+            subprocess.Popen([str(pbi_exe), str(pbix)])
+        elif os.name == "nt":
+            os.startfile(str(pbix))  # type: ignore[attr-defined]
+        else:
+            return "Power BI Desktop only runs on Windows."
+        return "ok"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
 # ── HEADER ────────────────────────────────────────────────────────────────────
 st.title("📊 DataCycle Admin")
 st.caption("Pipeline status, quick actions, logs — all in one place. "
@@ -152,6 +215,103 @@ try:
 except Exception as e:
     db_ok = False
     db_err = str(e)[:200]
+
+
+# ── POWER BI FIRST-TIME SETUP WIZARD ──────────────────────────────────────────
+# Power BI Desktop stores the connection inside the .pbix's DataMashup binary
+# blob, which can't be safely patched at install time. So instead of trying
+# to hide that complexity, we show the user a one-shot wizard with their own
+# host / db / user values pre-filled (read from .env), a one-click button to
+# open the .pbix in PBI Desktop, and the exact 4-click sequence to re-point
+# the data source. Once dismissed, it collapses to a small green banner with
+# a "redo" link in case they need to switch DBs later. Password is NEVER
+# displayed — the user supplies it in the PBI auth dialog.
+def render_pbi_wizard():
+    state = _load_admin_state()
+    pbix = _find_pbix()
+    if not pbix:
+        return  # nothing to wizard about
+
+    if state.get("pbi_configured"):
+        # Compact "already configured" banner with a tiny reset link.
+        c1, c2 = st.columns([10, 1])
+        c1.success(f"✓ Power BI dashboard configured  ·  `{pbix.name}`")
+        if c2.button("redo", key="pbi_redo", help="Show the setup wizard again "
+                                                  "(use this if you switched DBs)"):
+            state["pbi_configured"] = False
+            _save_admin_state(state)
+            st.rerun()
+        return
+
+    # Full wizard.
+    with st.container(border=True):
+        st.subheader("🎨 Power BI Dashboard — First-Time Setup")
+        st.caption("Power BI dashboards need to be pointed at this machine's database "
+                   "once. About 30 seconds of clicking — your own values are pre-filled below.")
+
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 5432
+        db   = (parsed.path or "/").lstrip("/")
+        user = unquote(parsed.username or "")
+
+        st.markdown("**Your connection (auto-detected from `.env`)**")
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.markdown("Server")
+        cc1.code(f"{host}", language=None)
+        cc2.markdown("Database")
+        cc2.code(db, language=None)
+        cc3.markdown("Username")
+        cc3.code(user, language=None)
+        st.caption("Click the copy icon on any value above to copy it. "
+                   f"Port is {port} (Postgres default).")
+
+        st.divider()
+
+        # Step 1 — open the .pbix
+        s1c1, s1c2 = st.columns([1, 5])
+        s1c1.markdown("**Step 1**")
+        pbi_exe = _find_pbi_exe()
+        if s1c2.button("📂 Open Power BI Dashboard", type="primary", key="pbi_open"):
+            err = _open_pbix(pbix, pbi_exe)
+            if err == "ok":
+                s1c2.success(f"Launched Power BI Desktop → `{pbix.name}`")
+            else:
+                s1c2.error(f"Could not open: {err}")
+        if not pbi_exe and os.name == "nt":
+            s1c2.warning("Power BI Desktop not found. Install it from "
+                         "https://aka.ms/pbidesktopstore first.")
+
+        # Step 2 — re-point the source in PBI
+        s2c1, s2c2 = st.columns([1, 5])
+        s2c1.markdown("**Step 2**")
+        s2c2.markdown(
+            "In Power BI:\n"
+            "1. Click **Transform Data → Data source settings**\n"
+            "2. Select the existing PostgreSQL source, click **Change Source…**\n"
+            "3. Paste the **Server** and **Database** values from above\n"
+            "4. Click **OK**, then **Close**, then **Apply changes**"
+        )
+
+        # Step 3 — auth
+        s3c1, s3c2 = st.columns([1, 5])
+        s3c1.markdown("**Step 3**")
+        s3c2.markdown(
+            "When Power BI prompts for credentials:\n"
+            "1. **Authentication kind**: choose **Database** (not Windows)\n"
+            "2. **Username**: paste from above\n"
+            "3. **Password**: the Postgres password you set during installation\n"
+            "4. Click **Connect**"
+        )
+
+        st.divider()
+        if st.button("✓ I've configured the connection — don't show this again",
+                     key="pbi_dismiss"):
+            state["pbi_configured"] = True
+            _save_admin_state(state)
+            st.rerun()
+
+
+render_pbi_wizard()
 
 
 # ── TOP STATUS ROW ────────────────────────────────────────────────────────────
