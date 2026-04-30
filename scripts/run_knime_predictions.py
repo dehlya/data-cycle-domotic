@@ -1,0 +1,326 @@
+"""
+run_knime_predictions.py -- Run KNIME prediction workflows in batch mode
+=========================================================================
+Headlessly executes the deployed KNIME workflows so the predictions get
+written to gold.fact_prediction without anyone clicking through the GUI.
+
+Usage:
+    python scripts/run_knime_predictions.py            # run all
+    python scripts/run_knime_predictions.py motion     # only motion
+    python scripts/run_knime_predictions.py consumption# only consumption
+
+Requirements:
+    - KNIME Analytics Platform installed (auto-detected at common paths)
+    - Workflows deployed to ~/knime-workspace (done by the installer's
+      configure_bi_knime step)
+    - DB credentials in .env
+
+How credentials are injected:
+    KNIME forbids overwriting password fields via flow variables. To
+    sidestep this, the workflows use a "Variable to Credentials" node
+    that reads two plain String flow variables (db_user, db_pwd) and
+    constructs a credential object named 'db'. The PostgreSQL Connectors
+    bind to that credential via Authentication -> Credentials -> 'db'.
+
+    At runtime we just pass:
+        -workflow.variable=db_user,<user>,String
+        -workflow.variable=db_pwd,<password>,String
+
+    KNIME allows String flow-var overrides without restrictions; the
+    credential object is built internally before any password field is
+    touched, so KNIME's password-overwrite rule is never violated.
+
+    See ml/knime/SETUP.md for the GUI setup steps.
+
+This script is safe to schedule daily (Windows Task Scheduler / cron) to
+keep predictions fresh.
+
+Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
+"""
+
+import ctypes
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+from dotenv import load_dotenv
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
+DB_URL = os.getenv("DB_URL", "")
+
+KNIME_WORKSPACE = Path(os.path.expanduser("~/knime-workspace"))
+WORKFLOWS = {
+    "motion":      "Motion_Prediction_Server",
+    "consumption": "Consumption_Weather_Prediction_Server",
+}
+
+
+# ── ANSI ──────────────────────────────────────────────────────────────────────
+RESET="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"
+GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; BLUE="\033[36m"
+
+if not sys.stdout.isatty():
+    RESET = BOLD = DIM = GREEN = RED = YELLOW = BLUE = ""
+
+
+def header(msg):  print(f"\n{BOLD}{BLUE}== {msg} =={RESET}")
+def ok(msg):      print(f"  {GREEN}\u2713{RESET} {msg}")
+def warn(msg):    print(f"  {YELLOW}\u26a0{RESET} {msg}")
+def fail(msg):    print(f"  {RED}\u2717{RESET} {msg}")
+
+
+# ── KNIME LOCATION ────────────────────────────────────────────────────────────
+def find_knime():
+    """Locate the KNIME executable."""
+    candidates = []
+    if os.name == "nt":
+        candidates += [
+            Path(r"C:\Program Files\KNIME\knime.exe"),
+            Path(r"C:\Program Files (x86)\KNIME\knime.exe"),
+            Path(os.path.expanduser(r"~\AppData\Local\KNIME\knime.exe")),
+        ]
+    elif sys.platform == "darwin":
+        candidates += [Path("/Applications/KNIME.app/Contents/MacOS/Knime")]
+    else:
+        candidates += [
+            Path("/opt/knime/knime"),
+            Path(os.path.expanduser("~/knime/knime")),
+            Path("/usr/local/bin/knime"),
+        ]
+    for c in candidates:
+        if c.exists():
+            return c
+    on_path = shutil.which("knime")
+    return Path(on_path) if on_path else None
+
+
+def parse_db_credentials():
+    """Pull username + password out of DB_URL for the -credential flag."""
+    if not DB_URL:
+        return None, None
+    p = urlparse(DB_URL)
+    return unquote(p.username or ""), unquote(p.password or "")
+
+
+# ── MEMORY HYGIENE ────────────────────────────────────────────────────────────
+# Apps that hog memory and aren't needed during a KNIME batch run.
+# We don't kill 'python' or 'pythonw' here — that would shoot the watcher /
+# admin pane in the foot.
+MEMORY_HOG_PROCESSES = [
+    "chrome",        # Chrome
+    "msedge",        # Edge
+    "firefox",       # Firefox
+    "PBIDesktop",    # Power BI Desktop (it'll re-open clean later)
+    "Code",          # VS Code
+    "knime",         # any leftover KNIME GUI
+]
+
+
+def free_memory_gb() -> float | None:
+    """Return free physical memory in GB, or None if can't check."""
+    if os.name != "nt":
+        try:
+            import resource  # noqa
+            return None  # not implemented for non-Windows
+        except Exception:
+            return None
+    try:
+        # GlobalMemoryStatusEx on Windows
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        m = MEMORYSTATUSEX()
+        m.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        return m.ullAvailPhys / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def kill_memory_hogs() -> int:
+    """Stop processes in MEMORY_HOG_PROCESSES. Returns how many were killed.
+    Best-effort — never raises."""
+    killed = 0
+    if os.name == "nt":
+        for name in MEMORY_HOG_PROCESSES:
+            try:
+                # /F = force, /IM = image name, /T = also kill child trees
+                r = subprocess.run(
+                    ["taskkill", "/F", "/T", "/IM", f"{name}.exe"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                # taskkill returns 0 if killed, 128 if not running — both fine
+                if r.returncode == 0:
+                    # Count "SUCCESS:" lines as proxy for kill count
+                    killed += r.stdout.count("SUCCESS:")
+            except Exception:
+                continue
+    else:
+        for name in MEMORY_HOG_PROCESSES:
+            try:
+                subprocess.run(["pkill", "-f", name], capture_output=True, timeout=5)
+            except Exception:
+                continue
+    return killed
+
+
+def cleanup_jvm_dumps():
+    """KNIME OOM crashes leave hs_err_pid*.mdmp + replay_pid*.log all over
+    the project root. Sweep them before each run so they don't pile up."""
+    root = Path(__file__).resolve().parent.parent
+    swept = 0
+    for pat in ("hs_err_pid*.mdmp", "hs_err_pid*.log", "replay_pid*.log"):
+        for p in root.glob(pat):
+            try:
+                p.unlink()
+                swept += 1
+            except Exception:
+                pass
+    return swept
+
+
+def memory_preflight():
+    """Run before launching KNIME. Cleans crash dumps, optionally frees
+    memory, warns if tight."""
+    n = cleanup_jvm_dumps()
+    if n:
+        print(f"  {DIM}cleaned up {n} JVM crash dump file(s){RESET}")
+
+    free_gb = free_memory_gb()
+    if free_gb is None:
+        return  # couldn't check, skip
+    print(f"  {DIM}free physical memory: {free_gb:.1f} GB{RESET}")
+
+    auto_free = os.getenv("KNIME_FREE_MEMORY", "0") == "1"
+    if free_gb < 4 and auto_free:
+        print(f"  {YELLOW}closing memory-hog apps (KNIME_FREE_MEMORY=1)...{RESET}")
+        killed = kill_memory_hogs()
+        if killed:
+            print(f"  {GREEN}closed {killed} process(es){RESET}")
+            free_gb_after = free_memory_gb()
+            if free_gb_after:
+                print(f"  {DIM}free memory now: {free_gb_after:.1f} GB{RESET}")
+    elif free_gb < 4:
+        warn(f"Low free memory ({free_gb:.1f} GB). KNIME workflows may OOM.")
+        warn(f"  Close Chrome / Edge / Power BI Desktop / VS Code, OR set KNIME_FREE_MEMORY=1 in .env to auto-close.")
+
+
+# ── BATCH RUNNER ──────────────────────────────────────────────────────────────
+def run_workflow(knime_exe: Path, workflow_dir: Path, db_user: str, db_password: str) -> bool:
+    """Run one workflow in batch mode. Returns True on exit code 0."""
+    if not workflow_dir.exists():
+        fail(f"Workflow not found: {workflow_dir}")
+        warn(f"   Run the installer (or scripts/configure_bi_knime.py) to deploy it first.")
+        return False
+
+    print(f"  Running {workflow_dir.name} ...")
+    print(f"  {DIM}(this can take 5-30 min depending on data volume){RESET}")
+
+    cmd = [
+        str(knime_exe),
+        "-consoleLog",
+        "-nosplash",
+        "-reset",
+        "-application", "org.knime.product.KNIME_BATCH_APPLICATION",
+        "-workflowDir=" + str(workflow_dir),
+    ]
+    # Inject DB credentials as plain String flow variables. The workflows
+    # use a "Variable to Credentials" node that converts (db_user, db_pwd)
+    # strings into a credential object named "db", which the PostgreSQL
+    # Connectors bind to via the Authentication tab. This works because
+    # KNIME only blocks flow-var overrides on xpassword fields — plain
+    # strings are fine, and the credential object is built internally
+    # by Variable to Credentials before reaching any password field.
+    if db_user and db_password:
+        cmd.append(f"-workflow.variable=db_user,{db_user},String")
+        cmd.append(f"-workflow.variable=db_pwd,{db_password},String")
+
+    # IMPORTANT: do NOT pass -vmargs from here. Doing so makes the Eclipse
+    # launcher use --launcher.overrideVmargs, which wipes ALL the
+    # --add-opens flags KNIME's knime.ini sets up for its database driver
+    # classloader (which uses reflection on java.lang). Result: every PG
+    # Connector fails with InaccessibleObjectException + NoClassDefFoundError
+    # on DBDriverRegistry$DriverClassLoader.
+    #
+    # If you need to lower the heap for a memory-tight VM, edit
+    #   C:\Program Files\KNIME\knime.ini
+    # and change the -Xmx line (default ~12g). Don't try to override here.
+
+    t0 = datetime.now()
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    elapsed = (datetime.now() - t0).total_seconds()
+
+    if res.returncode == 0:
+        ok(f"  {workflow_dir.name} completed in {elapsed:.0f}s")
+        return True
+
+    fail(f"  {workflow_dir.name} failed (exit {res.returncode}, {elapsed:.0f}s)")
+    # Print last few lines of output to help debug
+    out_lines = (res.stdout + "\n" + res.stderr).strip().splitlines()
+    for line in out_lines[-15:]:
+        print(f"    {DIM}{line[:140]}{RESET}")
+    return False
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+def main():
+    header("Run KNIME Predictions")
+
+    knime_exe = find_knime()
+    if not knime_exe:
+        fail("KNIME Analytics Platform not detected.")
+        warn("  Install from https://www.knime.com/downloads")
+        sys.exit(1)
+    ok(f"KNIME: {knime_exe}")
+
+    if not KNIME_WORKSPACE.exists():
+        fail(f"KNIME workspace not found: {KNIME_WORKSPACE}")
+        warn("  Run the installer (or scripts/configure_bi_knime.py) to deploy workflows.")
+        sys.exit(1)
+    ok(f"Workspace: {KNIME_WORKSPACE}")
+
+    db_user, db_password = parse_db_credentials()
+    if db_user:
+        ok(f"DB credentials loaded for {db_user}")
+    else:
+        warn("DB_URL not in .env -- workflows will use embedded credentials only")
+
+    # Pick which workflows to run
+    args = [a for a in sys.argv[1:] if a in WORKFLOWS]
+    selected = args if args else list(WORKFLOWS.keys())
+
+    header(f"Running {len(selected)} workflow(s)")
+    # Memory hygiene — clean up old crash dumps + warn / auto-free if low
+    memory_preflight()
+
+    successes = failures = 0
+    for key in selected:
+        wf_dir = KNIME_WORKSPACE / WORKFLOWS[key]
+        if run_workflow(knime_exe, wf_dir, db_user, db_password):
+            successes += 1
+        else:
+            failures += 1
+
+    print()
+    print(f"{BOLD}Total:{RESET} {GREEN}{successes} ok{RESET}  {RED}{failures} failed{RESET}\n")
+    sys.exit(0 if failures == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()

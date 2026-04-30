@@ -81,29 +81,48 @@ def run():
         skipped = 0
         failed = 0
 
-        # 3. For each CSV file on the server
+        # Pre-filter to only files we actually need to download. This makes the
+        # progress bar reflect real work, not "skipped" noise.
+        to_download = []
         for filename in csv_files:
-
-            # 4. Create local path (Bronze)
-            #    Ex: Pred_2023-08-18.csv -> bronze/weather/2023/08/18/Pred_2023-08-18.csv
             local = bronze_path(filename)
             if local is None:
                 skipped += 1
                 continue
-
-            # 5. If it already exist -> skip
             if local.exists():
                 skipped += 1
                 continue
+            to_download.append((filename, local))
 
-            # 6. Otherwise -> download
-            try:
-                sftp.get(f"{SFTP_PATH}/{filename}", str(local))
-                log.info(f"  Downloaded {filename} → {local}")
-                copied += 1
-            except Exception as e:
-                log.error(f"  Failed to download {filename}: {e}")
-                failed += 1
+        if not to_download:
+            log.info(f"Bronze weather is up to date ({skipped} files already present)")
+        else:
+            log.info(f"{len(to_download)} new files to download "
+                     f"({skipped} already present in Bronze)")
+            import time as _t
+            t_start = _t.monotonic()
+
+            # Sequential download (sFTP server typically doesn't like concurrent
+            # sessions from the same client). Progress bar instead of per-file log.
+            for i, (filename, local) in enumerate(to_download, 1):
+                try:
+                    sftp.get(f"{SFTP_PATH}/{filename}", str(local))
+                    copied += 1
+                except Exception as e:
+                    log.error(f"  Failed to download {filename}: {e}")
+                    failed += 1
+                    continue
+
+                elapsed = _t.monotonic() - t_start
+                rate = i / elapsed if elapsed else 1
+                eta = (len(to_download) - i) / rate
+                pct = i / len(to_download) * 100
+                bar_w = 24
+                filled = int(bar_w * pct / 100)
+                bar = "█" * filled + "░" * (bar_w - filled)
+                # Single log line per file — no path spam
+                log.info(f"  [{bar}] {i:>3}/{len(to_download)}  {pct:5.1f}%  "
+                         f"{filename}  ETA {eta/60:.1f}min")
 
         log.info(f"Done: {copied} downloaded, {skipped} skipped, {failed} failed")
 

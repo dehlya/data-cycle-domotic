@@ -134,9 +134,118 @@ def run():
     elapsed = time.monotonic() - t_start
 
     print(f"\n{B}{'─' * 52}{R}")
-    print(f"{GR}{B}  Done in {elapsed:.1f}s{R}")
+    print(f"{GR}{B}  Raw MySQL import done in {elapsed:.1f}s{R}")
     print(f"  {GR}✓{R} {imported} tables · {total_rows:,} rows imported into silver schema")
     print()
+
+    # Transform raw error log → cleaned errors with proper types + apartment mapping
+    transform_di_errors(pg_engine)
+
+
+def _find_column(conn, schema, table, candidates):
+    """Find the actual column name (case-sensitive) matching any of the
+    candidate names case-insensitively. Returns None if no match.
+    Postgres preserves MySQL's original case when columns are imported via
+    quoted identifiers, so 'errorMessage' might land as 'ErrorMessage'."""
+    rows = conn.execute(text(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema=:s AND table_name=:t"
+    ), {"s": schema, "t": table}).fetchall()
+    by_lower = {r[0].lower(): r[0] for r in rows}
+    for cand in candidates:
+        actual = by_lower.get(cand.lower())
+        if actual:
+            return actual
+    return None
+
+
+def transform_di_errors(pg_engine):
+    """Transform raw silver.log_sensor_errors (TEXT cols, fresh from MySQL) into
+    silver.di_errors_clean with proper types, apartment_id mapping, and a
+    severity heuristic so populate_sensors.py's fact_device_health_day join
+    actually finds rows.
+
+    Auto-detects MySQL's case for each column (errorMessage vs ErrorMessage etc.)
+    so we don't crash on schema-case drift between MySQL versions or installs.
+    """
+    print(f"{B}clean_di_errors — silver.log_sensor_errors → silver.di_errors_clean{R}")
+    t = time.monotonic()
+    try:
+        with pg_engine.begin() as conn:
+            # Skip cleanly if upstream tables are missing (fresh install)
+            exists = conn.execute(text(
+                "SELECT to_regclass('silver.log_sensor_errors') IS NOT NULL"
+            )).scalar()
+            if not exists:
+                print(f"  {YL}⚠ silver.log_sensor_errors not found — nothing to transform{R}\n")
+                return
+
+            # Detect actual column names (case-insensitive match)
+            col_id      = _find_column(conn, "silver", "log_sensor_errors", ["idError", "iderror"])
+            col_bldg    = _find_column(conn, "silver", "log_sensor_errors", ["idBuilding", "idbuilding"])
+            col_msg     = _find_column(conn, "silver", "log_sensor_errors", ["errorMessage", "ErrorMessage", "errormessage"])
+            col_date    = _find_column(conn, "silver", "log_sensor_errors", ["creationDate", "CreationDate", "creationdate"])
+            if not (col_msg and col_date):
+                print(f"  {YL}⚠ Required columns missing in silver.log_sensor_errors "
+                      f"(found id={col_id}, bldg={col_bldg}, msg={col_msg}, date={col_date}){R}\n")
+                return
+
+            # Truncate target so re-runs are idempotent
+            conn.execute(text("TRUNCATE TABLE silver.di_errors_clean"))
+
+            # Apartment join is optional (uses silver.dim_buildings if present)
+            has_buildings = conn.execute(text(
+                "SELECT to_regclass('silver.dim_buildings') IS NOT NULL"
+            )).scalar()
+            bldg_col = None
+            house_col = None
+            if has_buildings:
+                bldg_col  = _find_column(conn, "silver", "dim_buildings", ["idBuilding", "IdBuilding", "idbuilding"])
+                house_col = _find_column(conn, "silver", "dim_buildings", ["houseName", "HouseName", "housename"])
+
+            apartment_join   = ""
+            apartment_select = "NULL::VARCHAR(20) AS apartment"
+            if has_buildings and bldg_col and house_col and col_bldg:
+                apartment_join = f'''
+                    LEFT JOIN silver.dim_buildings b
+                        ON b."{bldg_col}" = e."{col_bldg}"
+                '''
+                apartment_select = f'''
+                    CASE
+                        WHEN LOWER(COALESCE(b."{house_col}", '')) LIKE '%jimmy%'   THEN 'jimmy'
+                        WHEN LOWER(COALESCE(b."{house_col}", '')) LIKE '%jeremie%' THEN 'jeremie'
+                        ELSE NULL
+                    END::VARCHAR(20) AS apartment
+                '''
+
+            id_select = f'NULLIF(e."{col_id}", \'\')::INTEGER' if col_id else 'NULL::INTEGER'
+
+            insert_sql = f'''
+                INSERT INTO silver.di_errors_clean
+                    (error_id, sensor_id, room_id, apartment, timestamp, error_message, severity)
+                SELECT
+                    {id_select}                                AS error_id,
+                    NULL::VARCHAR(50)                          AS sensor_id,
+                    NULL::INTEGER                              AS room_id,
+                    {apartment_select},
+                    NULLIF(e."{col_date}", '')::TIMESTAMPTZ    AS timestamp,
+                    e."{col_msg}"                              AS error_message,
+                    CASE
+                        WHEN LOWER(e."{col_msg}") ~ 'fatal|crash|down|offline'   THEN 'high'
+                        WHEN LOWER(e."{col_msg}") ~ 'fail|error|exception|null'  THEN 'medium'
+                        ELSE 'low'
+                    END                                        AS severity
+                FROM silver.log_sensor_errors e
+                {apartment_join}
+                WHERE e."{col_date}" IS NOT NULL AND e."{col_date}" <> ''
+            '''
+            result = conn.execute(text(insert_sql))
+            n = result.rowcount
+            elapsed_t = time.monotonic() - t
+            print(f"  {GR}✓{R} silver.di_errors_clean populated  "
+                  f"{D}({n:,} rows · {elapsed_t:.1f}s){R}\n")
+    except Exception as ex:
+        print(f"  {RE}✗ transform_di_errors failed: {ex}{R}\n")
 
 
 if __name__ == "__main__":

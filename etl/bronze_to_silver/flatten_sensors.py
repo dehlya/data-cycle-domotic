@@ -7,15 +7,20 @@ Only scans recent Bronze folders instead of full rglob.
 Author: Group 14 - Data Cycle Project - HES-SO Valais 2026
 """
 
+import csv
+import gzip
+import io
 import json
 import logging
 import os
+import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+from psycopg2 import extras as _pg_extras
 from sqlalchemy import create_engine, text
 
 load_dotenv()
@@ -24,13 +29,44 @@ BRONZE_ROOT = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
 DB_URL      = os.getenv("DB_URL")
 APARTMENTS  = ["jimmy", "jeremie"]
 WORKERS     = 8
-BATCH_SIZE  = 2000
-LOG_EVERY   = 10
+BATCH_SIZE  = 5000  # bigger batches = fewer round-trips + better COPY amortisation
+LOG_EVERY   = 1     # log after every batch — keeps the user reassured during long runs
+
+# After a batch is successfully inserted into silver + watermarked, compress
+# the bronze JSON files in place (file.json -> file.json.gz). This preserves
+# the full audit trail (the whole point of having a bronze layer) while
+# shrinking disk usage 10-15x with gzip. Set KEEP_BRONZE=1 to keep raw
+# uncompressed files (e.g. for debugging). Set DELETE_BRONZE=1 to delete
+# instead of compress (only for hard-disk-tight VMs that don't need the
+# audit trail).
+COMPRESS_BRONZE_ON_SILVER = os.getenv("KEEP_BRONZE", "0") != "1" and os.getenv("DELETE_BRONZE", "0") != "1"
+DELETE_BRONZE_ON_SILVER   = os.getenv("DELETE_BRONZE", "0") == "1"
+
+# When we delete a file from bronze, we also append its filename to this log.
+# bulk_to_bronze.py reads this log on every scan and skips files listed here,
+# so a later SMB rescan doesn't re-copy the same files we just cleaned up.
+PROCESSED_LOG = (BRONZE_ROOT.parent / "processed.log") if BRONZE_ROOT.is_absolute() \
+    else (Path(__file__).resolve().parent.parent.parent / BRONZE_ROOT.parent / "processed.log")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("flatten_sensors")
 
 R="\033[0m"; B="\033[1m"; D="\033[2m"; GR="\033[32m"; RE="\033[31m"
+
+
+def canonical_bronze_name(name: str) -> str:
+    """Strip trailing .gz so .json and .json.gz map to the same watermark key.
+    Lets us recognise compressed-and-already-processed files without
+    fragmenting the watermark across two suffixes."""
+    return name[:-3] if name.endswith(".gz") else name
+
+
+def open_bronze(path: Path):
+    """Open a bronze file as a text stream, handling both .json and .json.gz."""
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, encoding="utf-8")
+
 
 # -- WATERMARK -----------------------------------------------------------------
 
@@ -56,11 +92,85 @@ def watermark_count(engine):
 
 
 def mark_done(engine, filenames):
-    with engine.begin() as conn:
-        conn.execute(
-            text("INSERT INTO silver.etl_watermark (filename) VALUES (:f) ON CONFLICT DO NOTHING"),
-            [{"f": f} for f in filenames]
+    """Bulk-mark filenames as processed. Uses psycopg2.execute_values for
+    ~10-30x speedup over SQLAlchemy executemany."""
+    if not filenames:
+        return
+    raw = engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        _pg_extras.execute_values(
+            cur,
+            "INSERT INTO silver.etl_watermark (filename) VALUES %s ON CONFLICT DO NOTHING",
+            [(f,) for f in filenames],
+            page_size=5000,
         )
+        raw.commit()
+    finally:
+        raw.close()
+
+
+def _append_processed_log(filenames: list[str]):
+    """Append filenames to processed.log so future SMB rescans + watermark
+    scans skip them. Best-effort."""
+    try:
+        PROCESSED_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with PROCESSED_LOG.open("a", encoding="utf-8") as f:
+            for name in filenames:
+                f.write(name + "\n")
+    except Exception as e:
+        log.warning(f"Could not append to {PROCESSED_LOG}: {e}")
+
+
+def compress_bronze_files(paths: list[str], filenames: list[str]):
+    """Compress bronze files in-place after silver ingestion (file.json
+    -> file.json.gz, original removed). Preserves the audit trail while
+    shrinking disk usage ~10-15x for typical sensor JSON payloads.
+
+    Best-effort: never crashes the pipeline on a permission error or
+    missing file, just counts and warns.
+    """
+    if not paths:
+        return 0, 0
+    compressed = 0
+    failed = 0
+    for p in paths:
+        try:
+            src = Path(p)
+            if not src.exists():
+                # Already processed in a previous run, skip silently
+                continue
+            dst = src.with_suffix(src.suffix + ".gz")
+            with src.open("rb") as f_in, gzip.open(dst, "wb", compresslevel=6) as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            src.unlink()
+            compressed += 1
+        except Exception:
+            failed += 1
+    _append_processed_log(filenames)
+    return compressed, failed
+
+
+def delete_bronze_files(paths: list[str], filenames: list[str]):
+    """Hard-delete bronze files that just made it into silver. Used only
+    when DELETE_BRONZE=1; the default path is compress_bronze_files()
+    instead, which keeps the audit trail.
+
+    Best-effort: never crashes the pipeline on a permission error or
+    missing file, just counts and warns.
+    """
+    if not paths:
+        return 0, 0
+    deleted = 0
+    failed = 0
+    for p in paths:
+        try:
+            Path(p).unlink(missing_ok=True)
+            deleted += 1
+        except Exception:
+            failed += 1
+    _append_processed_log(filenames)
+    return deleted, failed
 
 # -- SENSOR PARSING ------------------------------------------------------------
 
@@ -155,31 +265,107 @@ def flatten(apt, payload, ts):
 def process_batch(args):
     paths_and_apt, db_url = args
     all_rows = []
-    processed = []
+    processed = []        # filenames (for watermark)
+    processed_paths = []  # full paths (for optional deletion)
     errors = 0
     for path_str, apt in paths_and_apt:
         try:
-            with open(Path(path_str), encoding="utf-8") as f:
+            path = Path(path_str)
+            with open_bronze(path) as f:
                 payload = json.load(f)
             ts = parse_timestamp(payload.get("datetime", ""))
             all_rows.extend(flatten(apt, payload, ts))
-            processed.append(Path(path_str).name)
+            # Always store the canonical (.json) form in the watermark, even
+            # if we just read a .json.gz — keeps the watermark key stable
+            # whether or not the file has been compressed.
+            processed.append(canonical_bronze_name(path.name))
+            processed_paths.append(path_str)
         except Exception:
             errors += 1
-    return {"rows": all_rows, "processed": processed, "errors": errors}
+    return {
+        "rows": all_rows,
+        "processed": processed,
+        "processed_paths": processed_paths,
+        "errors": errors,
+    }
 
 
-UPSERT_SQL = text("""
-    INSERT INTO silver.sensor_events (apartment, room, sensor_type, field, value, unit, timestamp, is_outlier)
-    VALUES (:apartment, :room, :sensor_type, :field, :value, :unit, :timestamp, :is_outlier)
+_TEMP_DDL = """
+    CREATE TEMP TABLE _tmp_sensor_events (
+        apartment   text,
+        room        text,
+        sensor_type text,
+        field       text,
+        value       double precision,
+        unit        text,
+        "timestamp" timestamptz,
+        is_outlier  boolean
+    ) ON COMMIT DROP
+"""
+
+# Upsert from temp table. DISTINCT ON dedupes within the batch so PostgreSQL
+# doesn't complain about "command cannot affect row a second time" when the
+# same (apartment, room, sensor_type, field, timestamp) appears twice.
+_UPSERT_FROM_TMP = """
+    INSERT INTO silver.sensor_events
+        (apartment, room, sensor_type, field, value, unit, timestamp, is_outlier)
+    SELECT DISTINCT ON (apartment, room, sensor_type, field, timestamp)
+           apartment, room, sensor_type, field, value, unit, timestamp, is_outlier
+    FROM _tmp_sensor_events
+    ORDER BY apartment, room, sensor_type, field, timestamp
     ON CONFLICT (apartment, room, sensor_type, field, timestamp)
-    DO UPDATE SET value=EXCLUDED.value, unit=EXCLUDED.unit, is_outlier=EXCLUDED.is_outlier
-""")
+    DO UPDATE SET value      = EXCLUDED.value,
+                  unit       = EXCLUDED.unit,
+                  is_outlier = EXCLUDED.is_outlier
+"""
 
 def upsert(engine, rows):
-    if rows:
-        with engine.begin() as conn:
-            conn.execute(UPSERT_SQL, rows)
+    """Bulk-upsert sensor events using PostgreSQL COPY into a TEMP TABLE,
+    then a single INSERT ... SELECT ... ON CONFLICT to merge into silver.
+
+    COPY is the fastest bulk-load mechanism in Postgres — bytes stream
+    directly into the temp table, no statement parsing per row, no per-row
+    network round trips. Combined with a single set-based upsert, this is
+    typically 5-10x faster than execute_values and 50-150x faster than the
+    original per-row INSERT.
+    """
+    if not rows:
+        return
+    raw = engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.execute(_TEMP_DDL)
+
+        # Stream rows as CSV into the temp table. NULL '' makes empty cells
+        # be NULL (so missing value/unit doesn't blow up doubles).
+        buf = io.StringIO()
+        w = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+        for r in rows:
+            ts = r["timestamp"]
+            if hasattr(ts, "isoformat"):
+                ts = ts.isoformat()
+            w.writerow([
+                r["apartment"],
+                r["room"],
+                r["sensor_type"],
+                r["field"],
+                r["value"] if r["value"] is not None else "",
+                r["unit"]  if r["unit"]  is not None else "",
+                ts,
+                "true" if r["is_outlier"] else "false",
+            ])
+        buf.seek(0)
+        cur.copy_expert(
+            "COPY _tmp_sensor_events "
+            "(apartment, room, sensor_type, field, value, unit, \"timestamp\", is_outlier) "
+            "FROM STDIN WITH (FORMAT CSV, NULL '')",
+            buf,
+        )
+
+        cur.execute(_UPSERT_FROM_TMP)
+        raw.commit()
+    finally:
+        raw.close()
 
 
 # -- FIND NEW FILES (FAST) -----------------------------------------------------
@@ -189,16 +375,27 @@ def count_bronze_files(apt):
     apt_root = BRONZE_ROOT / apt
     if not apt_root.exists():
         return 0
-    return sum(1 for _ in apt_root.rglob("*.json"))
+    # Match both raw (.json) and compressed (.json.gz) files so the count
+    # reflects the real bronze footprint after compress-after-silver.
+    return sum(1 for _ in apt_root.rglob("*.json*"))
 
 
 def find_new_files_fast(engine, watermark_set):
     """
-    For each apartment, walk Bronze folders from newest to oldest.
-    Stop scanning an apartment once we hit a streak of files that
-    are all in the watermark (meaning everything older is too).
+    For each apartment, scan ALL bronze JSON files and pick the ones not in
+    the watermark.
+
+    Note: the previous version had a "stop after 50 consecutive watermarked
+    files" optimization that was UNSAFE because the parallel ProcessPool +
+    as_completed in run() can mark batches done out of order. After an
+    interrupted backfill, the watermark contains a random subset of files
+    (often the newest few thousand finish first), so the optimization
+    triggered on the newest folders and falsely concluded "up to date" while
+    leaving most of the work undone.
+
+    A full scan over ~200k files takes 1-3 seconds — cheap insurance against
+    silent data loss.
     """
-    STOP_AFTER = 50  # consecutive watermarked files before we stop
     all_tasks = []
 
     for apt in APARTMENTS:
@@ -207,33 +404,24 @@ def find_new_files_fast(engine, watermark_set):
             log.warning(f"Bronze folder not found: {apt_root}")
             continue
 
-        # Get all year/month/day/hour folders sorted descending (newest first)
-        hour_folders = sorted(apt_root.glob("*/*/*/*"), reverse=True)
-        consecutive_existing = 0
         apt_new = 0
-
-        for folder in hour_folders:
-            if not folder.is_dir():
-                continue
-
-            files = sorted(folder.glob("*.json"), reverse=True)
-            for f in files:
-                if f.name in watermark_set:
-                    consecutive_existing += 1
-                    if consecutive_existing >= STOP_AFTER:
-                        break
-                else:
-                    consecutive_existing = 0
-                    all_tasks.append((str(f), apt))
-                    apt_new += 1
-
-            if consecutive_existing >= STOP_AFTER:
-                break
+        apt_total = 0
+        # Walk ALL year/month/day/hour folders, no early stop. Match both
+        # raw (.json) and compressed (.json.gz) — so a silver rebuild after
+        # compress-after-silver can still replay from compressed bronze.
+        for f in apt_root.rglob("*.json*"):
+            apt_total += 1
+            # Compare on the canonical (.json) form so a .json.gz we already
+            # processed (entry stored as .json) is recognised and skipped.
+            if canonical_bronze_name(f.name) not in watermark_set:
+                all_tasks.append((str(f), apt))
+                apt_new += 1
 
         if apt_new > 0:
-            log.info(f"[{apt}] {apt_new:,} new files to process")
+            log.info(f"[{apt}] {apt_new:,} new files to process  "
+                     f"({apt_total:,} total in bronze)")
         else:
-            log.info(f"[{apt}] up to date")
+            log.info(f"[{apt}] up to date  ({apt_total:,} total in bronze)")
 
     return all_tasks
 
@@ -267,9 +455,11 @@ def run():
         return
 
     batches = [all_tasks[i:i+BATCH_SIZE] for i in range(0, len(all_tasks), BATCH_SIZE)]
-    log.info(f"Batches: {len(batches)} x {BATCH_SIZE} files")
+    log.info(f"Batches: {len(batches)} x {BATCH_SIZE} files  ({WORKERS} parallel workers)")
+    log.info(f"Starting... first progress line will appear after the first batch finishes (~10-30s).")
 
     total_files = total_rows = total_errors = 0
+    total_compressed = total_deleted = 0
     t_start = time.monotonic()
 
     with ProcessPoolExecutor(max_workers=WORKERS) as executor:
@@ -281,13 +471,32 @@ def run():
             total_files  += len(result["processed"])
             total_rows   += len(result["rows"])
             total_errors += result["errors"]
+            # Bronze post-processing: by default, COMPRESS in place to keep
+            # the audit trail while shrinking disk ~10-15x. Hard-delete only
+            # if DELETE_BRONZE=1 is explicitly set.
+            if COMPRESS_BRONZE_ON_SILVER:
+                done, failed = compress_bronze_files(
+                    result["processed_paths"], result["processed"]
+                )
+                total_compressed += done
+            elif DELETE_BRONZE_ON_SILVER:
+                done, failed = delete_bronze_files(
+                    result["processed_paths"], result["processed"]
+                )
+                total_deleted += done
 
             if n % LOG_EVERY == 0 or n == len(batches):
                 elapsed   = time.monotonic() - t_start
                 rate      = total_files / elapsed if elapsed > 0 else 1
                 remaining = (len(all_tasks) - total_files) / rate
                 pct       = total_files / len(all_tasks) * 100
-                print(f"  {GR}v{R} {total_files:>7,} files  {total_rows:>10,} rows  {pct:.1f}%  {D}~{remaining/60:.1f}min remaining{R}")
+                # Render a simple text progress bar so users see motion
+                bar_w = 24
+                filled = int(bar_w * pct / 100)
+                bar = "█" * filled + "░" * (bar_w - filled)
+                print(f"  [{bar}] batch {n:>3}/{len(batches)}  "
+                      f"{total_files:>7,} files  {total_rows:>10,} rows  "
+                      f"{pct:5.1f}%  {D}~{remaining/60:.1f}min left{R}")
 
     elapsed = time.monotonic() - t_start
     total_time = time.monotonic() - t0

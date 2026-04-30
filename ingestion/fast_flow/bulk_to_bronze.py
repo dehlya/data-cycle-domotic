@@ -36,6 +36,26 @@ SMB_PATH    = Path(os.getenv("SMB_PATH",    r"Z:\\"))
 BRONZE_ROOT = Path(os.getenv("BRONZE_ROOT", r"storage\bronze"))
 WORKERS     = 16
 
+# Files in this log were already imported to silver and intentionally deleted
+# from bronze (by scripts/cleanup_bronze.py). Skip them on every scan so the
+# nightly full-scan doesn't re-copy them from SMB.
+PROCESSED_LOG = BRONZE_ROOT.parent / "processed.log"
+
+
+def load_processed_filenames():
+    """Load the set of bronze filenames already processed + cleaned up."""
+    if not PROCESSED_LOG.exists():
+        return set()
+    try:
+        with PROCESSED_LOG.open(encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except Exception:
+        return set()
+
+
+PROCESSED = load_processed_filenames()
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("bulk_to_bronze")
 
@@ -68,8 +88,17 @@ def bronze_dest(apartment, ts, filename):
     return folder / filename
 
 
+def bronze_already_present(apartment, ts, filename):
+    """True if either the raw .json or its compressed .json.gz exists in
+    bronze for this filename. Used to avoid re-copying files we already
+    have (in either form)."""
+    folder = BRONZE_ROOT / apartment / ts.strftime("%Y") / ts.strftime("%m") / ts.strftime("%d") / ts.strftime("%H")
+    return (folder / filename).exists() or (folder / (filename + ".gz")).exists()
+
+
 def copy_file(src, dst):
     try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(src), str(dst))
         return "copied"
     except Exception as e:
@@ -88,7 +117,9 @@ def get_newest_bronze_filename():
         for folder in hour_folders:
             if not folder.is_dir():
                 continue
-            files = sorted(folder.glob("*.json"), reverse=True)
+            # Match both raw .json and compressed .json.gz so the "newest"
+            # check survives compress-after-silver runs.
+            files = sorted(folder.glob("*.json*"), reverse=True)
             if files:
                 name = files[0].name
                 if newest is None or name > newest:
@@ -122,8 +153,13 @@ def find_new_files_predict(after_filename):
             if smb_file.exists():
                 apt_local = identify_apartment(filename)
                 if apt_local:
+                    # Skip if this file was already imported + cleaned up.
+                    if filename in PROCESSED:
+                        found_this_minute = True
+                        continue
                     dst = bronze_dest(apt_local, current_dt, filename)
-                    if not dst.exists():
+                    # Check both raw and compressed (.json + .json.gz)
+                    if not bronze_already_present(apt_local, current_dt, filename):
                         new_files.append((smb_file, dst))
                 found_this_minute = True
 
@@ -156,6 +192,7 @@ def find_new_files_full():
     if not all_files:
         return []
 
+    log.info(f"Skip-list (already imported + cleaned): {len(PROCESSED):,} filenames")
     log.info("Checking newest first...")
     new_files = []
     consecutive_existing = 0
@@ -164,11 +201,18 @@ def find_new_files_full():
         apt = identify_apartment(name)
         if not apt:
             continue
+        # Skip if this file was already imported + cleaned up from bronze.
+        if name in PROCESSED:
+            consecutive_existing += 1
+            if consecutive_existing >= 50:
+                break
+            continue
         ts  = parse_filename_timestamp(name)
         dst = BRONZE_ROOT / apt / ts.strftime("%Y") / ts.strftime("%m") / ts.strftime("%d") / ts.strftime("%H") / name
         src = SMB_PATH / name
 
-        if dst.exists():
+        # Skip if either raw or compressed copy exists in bronze
+        if dst.exists() or dst.with_suffix(dst.suffix + ".gz").exists():
             consecutive_existing += 1
             if consecutive_existing >= 50:
                 break

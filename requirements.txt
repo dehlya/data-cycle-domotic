@@ -15,8 +15,13 @@ scikit-learn==1.3.2
 statsmodels==0.14.1
 numpy==1.26.2
 
-# Orchestration
-apache-airflow==2.8.0
+# (Power BI Python visuals need matplotlib + pandas, but those go into
+# PBI's own Python interpreter — installed by configure_pbi_python() in
+# the installer. We can't redirect PBI to our venv since PBI doesn't
+# accept a venv layout as a valid Python home.)
+
+# Admin UI
+streamlit==1.32.2
 
 # Testing
 pytest==7.4.3

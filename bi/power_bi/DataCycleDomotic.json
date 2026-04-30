@@ -1,0 +1,309 @@
+{
+    "name": "Data Cycle Domotic",
+    "dataColors": [
+        "#E86C00",
+        "#2E7D32",
+        "#1565C0",
+        "#C62828",
+        "#6A1B9A",
+        "#00838F",
+        "#F4A261",
+        "#4E342E"
+    ],
+    "good": "#2E7D32",
+    "neutral": "#E86C00",
+    "bad": "#C62828",
+    "maximum": "#C62828",
+    "center": "#E86C00",
+    "minimum": "#2E7D32",
+    "background": "#F5F3EE",
+    "foreground": "#2D2D2D",
+    "firstLevelElements": "#2D2D2D",
+    "secondLevelElements": "#6E6E6E",
+    "thirdLevelElements": "#E5E3DE",
+    "fourthLevelElements": "#B8B5AE",
+    "secondaryBackground": "#FFFFFF",
+    "tableAccent": "#E86C00",
+    "hyperlink": "#1565C0",
+    "textClasses": {
+        "callout": {
+            "fontSize": 36,
+            "fontFace": "Segoe UI Semibold",
+            "color": "#2D2D2D"
+        },
+        "title": {
+            "fontSize": 9,
+            "fontFace": "Segoe UI Semibold",
+            "color": "#9E9E9E"
+        },
+        "header": {
+            "fontSize": 11,
+            "fontFace": "Segoe UI Semibold",
+            "color": "#4A4A4A"
+        },
+        "label": {
+            "fontSize": 10,
+            "fontFace": "Segoe UI",
+            "color": "#6E6E6E"
+        }
+    },
+    "visualStyles": {
+        "*": {
+            "*": {
+                "background": [{
+                    "color": {"solid": {"color": "#FFFFFF"}},
+                    "transparency": 0,
+                    "show": true
+                }],
+                "border": [{
+                    "color": {"solid": {"color": "#E5E3DE"}},
+                    "show": true,
+                    "radius": 8,
+                    "width": 1
+                }],
+                "visualHeader": [{
+                    "show": false
+                }],
+                "dropShadow": [{
+                    "show": true,
+                    "color": {"solid": {"color": "#C8C5BE"}},
+                    "transparency": 60,
+                    "shadowBlur": 12,
+                    "shadowDistance": 4,
+                    "shadowSpread": 0,
+                    "angle": 135
+                }],
+                "padding": [{
+                    "top": 8,
+                    "right": 12,
+                    "bottom": 8,
+                    "left": 12
+                }]
+            }
+        },
+        "card": {
+            "*": {
+                "background": [{
+                    "color": {"solid": {"color": "#FFFFFF"}},
+                    "transparency": 0,
+                    "show": true
+                }],
+                "border": [{
+                    "color": {"solid": {"color": "#E5E3DE"}},
+                    "show": true,
+                    "radius": 10,
+                    "width": 1
+                }],
+                "dropShadow": [{
+                    "show": true,
+                    "color": {"solid": {"color": "#C8C5BE"}},
+                    "transparency": 50,
+                    "shadowBlur": 16,
+                    "shadowDistance": 6,
+                    "shadowSpread": 0,
+                    "angle": 135
+                }],
+                "padding": [{
+                    "top": 16,
+                    "right": 16,
+                    "bottom": 16,
+                    "left": 16
+                }]
+            }
+        },
+        "slicer": {
+            "*": {
+                "background": [{
+                    "color": {"solid": {"color": "#F5F3EE"}},
+                    "show": true
+                }],
+                "border": [{
+                    "show": false
+                }],
+                "dropShadow": [{
+                    "show": false
+                }]
+            }
+        },
+        "donutChart": {
+            "*": {
+                "background": [{
+                    "color": {"solid": {"color": "#FFFFFF"}},
+                    "transparency": 0,
+                    "show": true
+                }],
+                "border": [{
+                    "color": {"solid": {"color": "#E5E3DE"}},
+                    "show": true,
+                    "radius": 10,
+                    "width": 1
+                }],
+                "legend": [{
+                    "show": false
+                }]
+            }
+        },
+        "barChart": {
+            "*": {
+                "background": [{
+                    "color": {"solid": {"color": "#FFFFFF"}},
+                    "show": true
+                }],
+                "border": [{
+                    "color": {"solid": {"color": "#E5E3DE"}},
+                    "show": true,
+                    "radius": 10,
+                    "width": 1
+                }],
+                "categoryAxis": [{
+                    "labelColor": {"solid": {"color": "#6E6E6E"}},
+                    "fontSize": 10
+                }],
+                "valueAxis": [{
+                    "labelColor": {"solid": {"color": "#9E9E9E"}},
+                    "gridlineColor": {"solid": {"color": "#F0EDE8"}},
+                    "fontSize": 9
+                }]
+            }
+        },
+        "columnChart": {
+            "*": {
+                "background": [{
+                    "color": {"solid": {"color": "#FFFFFF"}},
+                    "show": true
+                }],
+                "border": [{
+                    "color": {"solid": {"color": "#E5E3DE"}},
+                    "show": true,
+                    "radius": 10,
+                    "width": 1
+                }],
+                "categoryAxis": [{
+                    "labelColor": {"solid": {"color": "#6E6E6E"}},
+                    "fontSize": 10
+                }],
+                "valueAxis": [{
+                    "labelColor": {"solid": {"color": "#9E9E9E"}},
+                    "gridlineColor": {"solid": {"color": "#F0EDE8"}},
+                    "fontSize": 9
+                }]
+            }
+        },
+        "lineChart": {
+            "*": {
+                "background": [{
+                    "color": {"solid": {"color": "#FFFFFF"}},
+                    "show": true
+                }],
+                "border": [{
+                    "color": {"solid": {"color": "#E5E3DE"}},
+                    "show": true,
+                    "radius": 10,
+                    "width": 1
+                }],
+                "categoryAxis": [{
+                    "labelColor": {"solid": {"color": "#6E6E6E"}},
+                    "fontSize": 10
+                }],
+                "valueAxis": [{
+                    "labelColor": {"solid": {"color": "#9E9E9E"}},
+                    "gridlineColor": {"solid": {"color": "#F0EDE8"}},
+                    "fontSize": 9
+                }]
+            }
+        },
+        "tableEx": {
+            "*": {
+                "border": [{
+                    "color": {"solid": {"color": "#E5E3DE"}},
+                    "show": true,
+                    "radius": 10,
+                    "width": 1
+                }],
+                "grid": [{
+                    "gridVertical": true,
+                    "gridVerticalColor": {"solid": {"color": "#F0EDE8"}},
+                    "gridHorizontalColor": {"solid": {"color": "#F0EDE8"}}
+                }],
+                "columnHeaders": [{
+                    "fontColor": {"solid": {"color": "#4A4A4A"}},
+                    "backColor": {"solid": {"color": "#F5F3EE"}},
+                    "fontSize": 10
+                }],
+                "values": [{
+                    "fontColorPrimary": {"solid": {"color": "#2D2D2D"}},
+                    "backColorPrimary": {"solid": {"color": "#FFFFFF"}},
+                    "fontColorSecondary": {"solid": {"color": "#2D2D2D"}},
+                    "backColorSecondary": {"solid": {"color": "#FAFAF7"}},
+                    "fontSize": 10
+                }]
+            }
+        },
+        "pivotTable": {
+            "*": {
+                "border": [{
+                    "color": {"solid": {"color": "#E5E3DE"}},
+                    "show": true,
+                    "radius": 10,
+                    "width": 1
+                }],
+                "grid": [{
+                    "gridVertical": true,
+                    "gridVerticalColor": {"solid": {"color": "#F0EDE8"}},
+                    "gridHorizontalColor": {"solid": {"color": "#F0EDE8"}}
+                }],
+                "columnHeaders": [{
+                    "fontColor": {"solid": {"color": "#4A4A4A"}},
+                    "backColor": {"solid": {"color": "#F5F3EE"}},
+                    "fontSize": 10
+                }],
+                "rowHeaders": [{
+                    "fontColor": {"solid": {"color": "#4A4A4A"}},
+                    "backColor": {"solid": {"color": "#FFFFFF"}},
+                    "fontSize": 10
+                }],
+                "values": [{
+                    "fontColorPrimary": {"solid": {"color": "#2D2D2D"}},
+                    "backColorPrimary": {"solid": {"color": "#FFFFFF"}},
+                    "fontColorSecondary": {"solid": {"color": "#2D2D2D"}},
+                    "backColorSecondary": {"solid": {"color": "#FAFAF7"}},
+                    "fontSize": 10
+                }]
+            }
+        },
+        "shape": {
+            "*": {
+                "background": [{
+                    "show": false
+                }],
+                "border": [{
+                    "show": false
+                }],
+                "dropShadow": [{
+                    "show": false
+                }]
+            }
+        },
+        "textbox": {
+            "*": {
+                "background": [{
+                    "show": false
+                }],
+                "border": [{
+                    "show": false
+                }],
+                "dropShadow": [{
+                    "show": false
+                }]
+            }
+        },
+        "page": {
+            "*": {
+                "background": [{
+                    "color": {"solid": {"color": "#F5F3EE"}},
+                    "transparency": 0
+                }]
+            }
+        }
+    }
+}
