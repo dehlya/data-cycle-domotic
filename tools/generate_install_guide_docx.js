@@ -302,8 +302,11 @@ main.push(tbl(
     ["SMB path not found: Z:\\", "Mount failed — installer prints the net use command it tried; run it manually with the correct credentials, then re-run installer."],
     ["Silver step says \"0 new files\" but bronze has data", "Old bug — pull latest, re-run. The watermark scanner now does a full scan each time."],
     ["KNIME predictions fail with \"Attempt to overwrite the password\"", "Old .knwf shipped before the Variable-to-Credentials swap. Pull latest, re-run configure_bi_knime.py then deploy_knime.py."],
+    ["KNIME predictions fail with \"Unsupported workflow version: 5.9.x\"", "The .knwf was exported from a newer KNIME than the VM has. Pull latest (.knwf files are pinned to 5.8) or open them in your VM's KNIME and re-export."],
     ["Admin dashboard fails with \"DB_URL not set\"", ".env empty or missing. Re-run installer (idempotent — won't redo finished work)."],
     ["Java exit code=4 on KNIME", "KNIME GUI is open with the same workspace. Close it (Stop-Process -Name knime -Force) and retry."],
+    ["Power BI Python visual: ModuleNotFoundError: No module named 'matplotlib'", "Power BI's own Python interpreter is missing matplotlib/pandas. The installer auto-installs them; if it failed, do it manually: & \"$env:LOCALAPPDATA\\Programs\\Python\\Python311\\python.exe\" -m pip install matplotlib pandas (adjust the version to match what PBI's Options → Python scripting shows). Then refresh the visual."],
+    ["Power BI dashboard: tables empty / 'Cannot connect'", "The .pbix data source still points at the developer's DB — Power BI keeps the connection in a binary blob the installer cannot patch. Use the Power BI First-Time Setup wizard at the top of the admin pane (http://localhost:8501): host / DB / user are pre-filled with copy buttons and the wizard walks through Transform Data → Data source settings → Change Source. ~30 seconds."],
   ],
   [4500, 4860],
 ));

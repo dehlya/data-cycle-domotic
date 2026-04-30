@@ -509,36 +509,54 @@ def install_deps(venv: Path, install_dir: Path):
 
 
 def configure_pbi_python(install_dir: Path) -> bool:
-    """Point Power BI Desktop's Python visual interpreter at this install's
-    venv. PBI uses whatever Python is set under
-    HKCU\\SOFTWARE\\Microsoft\\Microsoft Power BI Desktop\\PythonScriptOptions
-    when rendering Python visuals inside .pbix files.
+    """Make sure Power BI Desktop's Python visual interpreter has the
+    packages our .pbix Python visuals need (matplotlib + pandas).
 
-    Without this, the customer hits a 'No module named matplotlib' error
-    the first time a Python visual tries to render — even though we ship
-    matplotlib in requirements.txt — because PBI is pointing at some
-    unrelated system Python by default.
+    PBI Desktop only accepts a *real* Python install layout as its
+    ``Python home`` (root containing python.exe + Lib/), so we can't
+    redirect it to our .venv (a venv has no python.exe at root and
+    Scripts/python.exe alone doesn't pass PBI's home-dir validation).
+    Earlier versions of this function tried writing a registry override
+    pointing at .venv\\Scripts; PBI ignored it and the .pbix kept
+    failing with 'No module named matplotlib'.
 
-    Idempotent. Windows-only (no-op elsewhere). Best-effort: if the
-    registry write fails (e.g. PBI never run yet), we just warn.
+    Pragmatic fix: pip install the deps into whichever system Python
+    PBI auto-detects, so PBI's existing interpreter has what it needs
+    on first refresh. Idempotent (pip skips already-installed). Windows-
+    only (Power BI is Windows-only).
     """
     if os.name != "nt":
         return False
-    venv_scripts = install_dir / ".venv" / "Scripts"
-    if not (venv_scripts / "python.exe").exists():
-        warn("venv Python not found — skipping Power BI Python config.")
+
+    # PBI auto-detects Pythons under %LOCALAPPDATA%\Programs\Python\PythonXY
+    # (the default location for python.org installers and `winget install
+    # python`). We try the common 3.x flavours, newest first.
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    candidates = [
+        local / "Programs" / "Python" / "Python313" / "python.exe",
+        local / "Programs" / "Python" / "Python312" / "python.exe",
+        local / "Programs" / "Python" / "Python311" / "python.exe",
+        local / "Programs" / "Python" / "Python310" / "python.exe",
+    ]
+    py = next((c for c in candidates if c.exists()), None)
+    if not py:
+        warn("No system Python found under %LOCALAPPDATA%\\Programs\\Python — "
+             "Power BI Python visuals may fail with 'No module named matplotlib'.")
+        warn("  Install Python from python.org (3.10+) and re-run, or pip-install "
+             "matplotlib + pandas manually into PBI's Python.")
         return False
+
+    print(f"  {DIM}Installing matplotlib + pandas into PBI's Python ({py.parent.name})…{RESET}")
     try:
-        import winreg
-        key_path = r"SOFTWARE\Microsoft\Microsoft Power BI Desktop\PythonScriptOptions"
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as k:
-            winreg.SetValueEx(k, "PythonHome",       0, winreg.REG_SZ,    str(venv_scripts))
-            winreg.SetValueEx(k, "PythonOverridden", 0, winreg.REG_DWORD, 1)
-        ok(f"Power BI Python interpreter -> {venv_scripts}")
+        subprocess.run(
+            [str(py), "-m", "pip", "install", "--quiet", "matplotlib", "pandas"],
+            check=True
+        )
+        ok(f"Power BI Python deps installed in {py.parent}")
         return True
     except Exception as e:
-        warn(f"Could not configure Power BI Python interpreter: {e}")
-        warn("  (Power BI Desktop must be installed first; safe to re-run later.)")
+        warn(f"Could not install PBI Python deps automatically: {e}")
+        warn(f"  Run manually: \"{py}\" -m pip install matplotlib pandas")
         return False
 
 

@@ -133,7 +133,10 @@ That's it.
 | `SMB path not found: Z:\` | Mount failed — installer prints the `net use` command it tried; run it manually with right credentials. |
 | Silver step says "0 new files" but bronze has data | Old bug — pull latest, re-run. The watermark scanner now does a full scan each time. |
 | KNIME predictions fail with "Attempt to overwrite the password" | Old `.knwf` shipped before the Variable-to-Credentials swap. Pull latest, re-run `configure_bi_knime.py` then `deploy_knime.py`. |
+| KNIME predictions fail with `Unsupported workflow version: 5.9.x` | The `.knwf` was exported from a newer KNIME than your VM has. Pull latest (`.knwf` files are pinned to 5.8) or open them in your VM's KNIME and re-export. |
 | Admin dashboard fails with "DB_URL not set" | `.env` empty or missing. Re-run installer (idempotent — won't redo finished work). |
+| Power BI Python visual: `ModuleNotFoundError: No module named 'matplotlib'` | Power BI's Python interpreter is missing `matplotlib`/`pandas`. The installer auto-installs them on a fresh run; if it failed (e.g. PBI installed *after* the installer ran), do it manually: `& "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe" -m pip install matplotlib pandas` (adjust `Python311` to whichever version PBI's *Options → Python scripting* shows as the detected home). Then refresh the visual. |
+| Power BI dashboard opens but tables are empty / "Cannot connect" | The `.pbix` data source still points at the developer's DB — Power BI keeps the connection in a binary blob the installer can't patch. Use the **Power BI First-Time Setup** wizard at the top of the admin pane (http://localhost:8501): your host / DB / user are pre-filled with copy buttons and the wizard walks through *Transform Data → Data source settings → Change Source*. Takes ~30 seconds. |
 
 ## Re-running the installer
 
