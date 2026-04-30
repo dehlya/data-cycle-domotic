@@ -53,6 +53,21 @@ log = logging.getLogger("flatten_sensors")
 
 R="\033[0m"; B="\033[1m"; D="\033[2m"; GR="\033[32m"; RE="\033[31m"
 
+
+def canonical_bronze_name(name: str) -> str:
+    """Strip trailing .gz so .json and .json.gz map to the same watermark key.
+    Lets us recognise compressed-and-already-processed files without
+    fragmenting the watermark across two suffixes."""
+    return name[:-3] if name.endswith(".gz") else name
+
+
+def open_bronze(path: Path):
+    """Open a bronze file as a text stream, handling both .json and .json.gz."""
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, encoding="utf-8")
+
+
 # -- WATERMARK -----------------------------------------------------------------
 
 WATERMARK_DDL = """
@@ -255,11 +270,15 @@ def process_batch(args):
     errors = 0
     for path_str, apt in paths_and_apt:
         try:
-            with open(Path(path_str), encoding="utf-8") as f:
+            path = Path(path_str)
+            with open_bronze(path) as f:
                 payload = json.load(f)
             ts = parse_timestamp(payload.get("datetime", ""))
             all_rows.extend(flatten(apt, payload, ts))
-            processed.append(Path(path_str).name)
+            # Always store the canonical (.json) form in the watermark, even
+            # if we just read a .json.gz — keeps the watermark key stable
+            # whether or not the file has been compressed.
+            processed.append(canonical_bronze_name(path.name))
             processed_paths.append(path_str)
         except Exception:
             errors += 1
@@ -356,7 +375,9 @@ def count_bronze_files(apt):
     apt_root = BRONZE_ROOT / apt
     if not apt_root.exists():
         return 0
-    return sum(1 for _ in apt_root.rglob("*.json"))
+    # Match both raw (.json) and compressed (.json.gz) files so the count
+    # reflects the real bronze footprint after compress-after-silver.
+    return sum(1 for _ in apt_root.rglob("*.json*"))
 
 
 def find_new_files_fast(engine, watermark_set):
@@ -385,10 +406,14 @@ def find_new_files_fast(engine, watermark_set):
 
         apt_new = 0
         apt_total = 0
-        # Walk ALL year/month/day/hour folders, no early stop.
-        for f in apt_root.rglob("*.json"):
+        # Walk ALL year/month/day/hour folders, no early stop. Match both
+        # raw (.json) and compressed (.json.gz) — so a silver rebuild after
+        # compress-after-silver can still replay from compressed bronze.
+        for f in apt_root.rglob("*.json*"):
             apt_total += 1
-            if f.name not in watermark_set:
+            # Compare on the canonical (.json) form so a .json.gz we already
+            # processed (entry stored as .json) is recognised and skipped.
+            if canonical_bronze_name(f.name) not in watermark_set:
                 all_tasks.append((str(f), apt))
                 apt_new += 1
 

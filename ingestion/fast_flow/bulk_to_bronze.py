@@ -117,7 +117,9 @@ def get_newest_bronze_filename():
         for folder in hour_folders:
             if not folder.is_dir():
                 continue
-            files = sorted(folder.glob("*.json"), reverse=True)
+            # Match both raw .json and compressed .json.gz so the "newest"
+            # check survives compress-after-silver runs.
+            files = sorted(folder.glob("*.json*"), reverse=True)
             if files:
                 name = files[0].name
                 if newest is None or name > newest:
