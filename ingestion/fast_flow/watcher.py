@@ -32,18 +32,21 @@ INTERVAL_SECS = 60
 NIGHTLY_HOUR  = 0  # midnight
 WEATHER_HOUR  = int(os.getenv("WEATHER_HOUR", "7"))   # hour to trigger weather
 WEATHER_MIN   = int(os.getenv("WEATHER_MIN", "30"))    # minute to trigger weather
+PREDICTIONS_DAY = int(os.getenv("PREDICTIONS_DAY", "1"))  # day-of-month to retrain ML (1 = first of each month)
 
 # Gold ETL refresh cadence (sensor facts).
 # Every N minutes the watcher kicks off populate_gold --sensors as a
 # subprocess so dashboards stay within N minutes of fresh.
 GOLD_INTERVAL_MIN = int(os.getenv("GOLD_INTERVAL_MIN", "15"))
 
-# Daily ML pipeline:
-#   1. weather download + clean (existing)
-#   2. populate_gold --weather  (new)
-#   3. run_knime_predictions     (new)
-#   4. cleanup_bronze            (new)
-# All triggered together at WEATHER_HOUR:WEATHER_MIN.
+# Daily ML pipeline at WEATHER_HOUR:WEATHER_MIN:
+#   1. weather download + clean   (daily)
+#   2. populate_gold --weather    (daily)
+#   3. cleanup_bronze             (daily)
+#
+# KNIME predictions retrain monthly only (day = PREDICTIONS_DAY) — daily
+# retraining was overkill given the 70k-row training window barely shifts
+# day to day, and a single KNIME run takes ~15 min.
 
 # -- ANSI COLORS ---------------------------------------------------------------
 
@@ -304,7 +307,8 @@ def run():
     print(f"{D}Interval : {INTERVAL_SECS}s{R}")
     print(f"{D}Fast flow : bulk_to_bronze -> flatten_sensors (every {INTERVAL_SECS}s){R}")
     print(f"{D}Gold      : populate_gold --sensors (every {GOLD_INTERVAL_MIN} min){R}")
-    print(f"{D}Daily ML  : weather + populate_gold --weather + KNIME + cleanup at {WEATHER_HOUR:02d}:{WEATHER_MIN:02d}{R}")
+    print(f"{D}Daily    : weather + populate_gold --weather + cleanup at {WEATHER_HOUR:02d}:{WEATHER_MIN:02d}{R}")
+    print(f"{D}Monthly  : KNIME ML retrain on day {PREDICTIONS_DAY:02d} at {WEATHER_HOUR:02d}:{WEATHER_MIN:02d}{R}")
     print(f"{D}Nightly   : full scan at {NIGHTLY_HOUR:02d}:00{R}")
     print(f"{D}Flags    : --scan (full scan + pipeline) | --weather (weather only){R}")
     print(f"{D}Ctrl+C to stop{R}\n")
@@ -413,7 +417,13 @@ def run():
                 t0_batch = time.monotonic()
                 run_weather_pipeline()
                 run_gold_etl("--weather")
-                run_predictions()
+                # KNIME retraining only on PREDICTIONS_DAY of each month
+                current_day = int(time.strftime("%d"))
+                if current_day == PREDICTIONS_DAY:
+                    print(f"  {CY}day {current_day} == PREDICTIONS_DAY -- retraining ML models{R}\n")
+                    run_predictions()
+                else:
+                    print(f"  {D}skipping ML retrain (next on day {PREDICTIONS_DAY:02d}){R}\n")
                 run_cleanup_bronze()
                 elapsed = time.monotonic() - t0_batch
 
