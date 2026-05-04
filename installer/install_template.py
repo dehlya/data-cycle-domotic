@@ -86,7 +86,7 @@ SMB_PASSWORD = "{{SMB_PASSWORD}}"
 SMB_DRIVE    = "{{SMB_DRIVE}}"
 
 REPO_URL = "https://github.com/dehlya/data-cycle-domotic.git"
-REPO_BRANCH = "release-final"  # switch to "main" once release-final is merged
+REPO_BRANCH = "main"  # release-final was merged → main on 2026-05-01
 DEFAULT_INSTALL_DIR = "data-cycle-domotic"
 
 # =============================================================================
