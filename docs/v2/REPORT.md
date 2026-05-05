@@ -131,6 +131,10 @@ The project's `README.md` at the root points to all of the above.
 
 ## 3. Architecture in brief
 
+![End-to-end pipeline diagram for UC2 — sources → bronze → silver → gold → BI/ML](../../_personal/diagrams/manual/architecture.png)
+
+The diagram above lays out every component end-to-end. In short:
+
 ```
 SMB share (sensor JSON) ─┐
 MySQL  (apartment dims)  ─┼─►  Bronze ──► Silver ──► Gold ──► KNIME predictions
@@ -139,6 +143,15 @@ sFTP   (weather CSV)     ─┘   (raw files) (Postgres) (star)   (motion + cons
                                                        ├─► Power BI dashboards (RLS)
                                                        └─► Streamlit admin pane
 ```
+
+The gold layer is shaped as a star schema: seven conformed dimensions
+(`dim_apartment`, `dim_room`, `dim_device`, `dim_date`, `dim_datetime`,
+`dim_tariff`, `dim_weather_site`) feed seven fact tables at minute / day
+grains plus a single materialised view (`mv_energy_with_cost`) for the
+BI cost callouts.
+
+![Gold star schema — dimensions, facts, and FK relationships](../../_personal/diagrams/manual/star-schema.png)
+
 
 A single Python process — `ingestion/fast_flow/watcher.py` — orchestrates
 the whole pipeline. Three concurrent loops:

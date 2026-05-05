@@ -16,9 +16,40 @@ The system runs entirely on a single Windows VM, with no cloud dependencies. Dep
 This document covers the architecture, data model, pipeline internals, configuration surface, security posture, ten architecture decisions made along the way (ADRs), and the operational runbook. Real install timings: ~4 hours on a fresh machine, ~15 minutes on a re-install once watermarks are in place.
 
 
+# How to read this document
+
+Forty-five pages is a lot. Use this map to jump straight to the part that answers your question.
+
+| If you want to… | Read |
+|---|---|
+| Get a 5-minute mental model of what the system does | §1 Architecture overview + the diagram in §1 |
+| Understand each external source and its volume | §1.1 Three external sources |
+| Know what's in bronze / silver / gold | §1.2 Medallion layers + §3 Data model details |
+| Read the gold star schema (dimensions, facts, FKs) | §3.2 Star schema for sensor facts |
+| Trace a sensor reading from JSON file to dashboard | §2 Pipeline details (top-down: 2.1 → 2.2 → 2.3 → 2.4) |
+| Understand why silver upserts are fast (and why slow) | §6 Performance — COPY upsert, unique-index wall, work_mem |
+| Re-run safely after a crash | §7 Idempotency guarantees |
+| Configure or tune a deployed instance | §11 Configuration + INSTALLATION.md |
+| Find a specific script and what it does | §18 Project layout + §16 Scripts reference |
+| See where logs land + what to grep for | §10 Monitoring & logs |
+| Diagnose a common failure | §13 Troubleshooting |
+| Know what the security posture is | §15 Security + §16 GDPR pseudonymisation |
+| Understand a design choice | §17 Architecture decision records (10 ADRs) |
+| Use the Power BI dashboards | USER_GUIDE.md (separate doc) |
+| Install on a fresh VM | INSTALLATION.md (separate doc) |
+| Read the GDPR / scalability / AI declaration | REPORT.md (separate doc) |
+
+Section numbers above match the chapter headings below; ADRs (chapter 17) are also individually addressable as `ADR-001` … `ADR-010`.
+
+
 # Architecture overview
 
+![End-to-end pipeline diagram for UC2 — sources → bronze → silver → gold → BI/ML](../../_personal/diagrams/manual/architecture.png)
+
 ## 1.1 Three external sources
+
+![Three sources at a glance — JSON sensors, MySQL pidb, weather CSV](../../_personal/diagrams/manual/sources-cards.png)
+
 
 | Source | Format | Volume | Path |
 |---|---|---|---|
@@ -28,11 +59,26 @@ This document covers the architecture, data model, pipeline internals, configura
 
 Skipped MySQL tables for GDPR / out-of-scope reasons: `users`, `events`, `actions`, `achievements`, `badges`, `userrelationships`. Rationale in chapter 16.
 
+A worked example of each source format:
+
+![JSON sensor fields — six categories nested in each per-minute file](../../_personal/diagrams/manual/json-fields.png)
+
+![Sample JSON readings — plugs, doorsWindows, motions, meteos, humidities, consumptions](../../_personal/diagrams/manual/json-sample.png)
+
+![MySQL `pidb` → silver tables we ingest](../../_personal/diagrams/manual/mysql-tables.png)
+
+![Tables explicitly skipped at ingestion — GDPR + non-analytical](../../_personal/diagrams/manual/mysql-skipped.png)
+
+![Weather forecast CSV — sample rows from a daily file (Sion site, PRED_T_2M_ctrl)](../../_personal/diagrams/manual/weather-sample.png)
+
 ## 1.2 Medallion layers (PostgreSQL 17)
 
 Three storage tiers, each with a distinct purpose:
 
 - **Bronze** — raw, immutable JSON / CSV files on the filesystem, partitioned by year/month/day/hour. Acts as the source of truth before any cleanup is applied. After successful silver insert, files are gzip-compressed in place (10–15× smaller) but kept readable so silver can always be replayed from bronze.
+
+  ![Bronze on-disk layout — Y/M/D/H folder partitioning](../../_personal/diagrams/manual/bronze-structure.png)
+
 - **Silver** — cleaned, normalised PostgreSQL tables. Sensor events go to a long-format `silver.sensor_events`; weather rows go to `silver.weather_forecasts` with one row per `(timestamp, site, prediction, prediction_date, measurement)` so all forecast revisions are preserved.
 - **Gold** — analytical star schema with conformed dimensions (`dim_apartment`, `dim_room`, `dim_device`, `dim_date`, `dim_datetime`, `dim_tariff`, `dim_weather_site`) and pre-aggregated fact tables (`fact_environment_minute`, `fact_energy_minute`, `fact_presence_minute`, `fact_device_health_day`, `fact_weather_hour`, `fact_prediction_motion`, `fact_prediction_consumption`) plus one materialised view (`mv_energy_with_cost`).
 
@@ -63,6 +109,8 @@ KNIME workflows live in `ml/knime/*.knwf` and are deployed to `~/knime-workspace
 
 ## 2.1 Bronze ingestion
 
+![Bronze filename + folder convention](../../_personal/diagrams/manual/json-format.png)
+
 ### Sensor JSONs (continuous)
 
 `ingestion/fast_flow/bulk_to_bronze.py` runs every 60 seconds inside the watcher loop. Two operating modes:
@@ -83,6 +131,14 @@ KNIME workflows live in `ml/knime/*.knwf` and are deployed to `~/knime-workspace
 - Storage: `storage\bronze\weather\YYYY\MM\DD\Pred_YYYY-MM-DD.csv`.
 
 ## 2.2 Bronze → Silver
+
+![Bronze → Silver — eight transformations applied during flatten](../../_personal/diagrams/manual/bronze-silver-transforms.png)
+
+![Schema creation — create_silver.py (run once per environment)](../../_personal/diagrams/manual/create-silver.png)
+
+![MySQL dimension import — 10 imported, 6 skipped](../../_personal/diagrams/manual/mysql-import.png)
+
+![Weather cleaning — clean_weather.py (sentinel filter + outlier flags + watermark)](../../_personal/diagrams/manual/clean-weather.png)
 
 ### Sensors
 
@@ -113,6 +169,13 @@ KNIME workflows live in `ml/knime/*.knwf` and are deployed to `~/knime-workspace
 
 ## 2.3 Silver → Gold
 
+![Gold schema — 5 dimensions + 4 facts + 1 materialized view](../../_personal/diagrams/manual/gold-summary.png)
+
+![Schema creation — create_gold.py (idempotent, builds dim_* and fact_* shells)](../../_personal/diagrams/manual/create-gold.png)
+
+![Population — populate_gold.py 9-step process with idempotent upserts](../../_personal/diagrams/manual/populate-gold.png)
+
+
 `etl/silver_to_gold/populate_gold.py` orchestrates a **9-step process** in order:
 
 1. **`populate_dimensions`** — refresh `dim_apartment`, `dim_room`, `dim_device`, `dim_date`, `dim_datetime`, `dim_tariff`, `dim_weather_site`. Set-based SQL: `INSERT INTO gold.dim_X ... SELECT FROM silver.X ON CONFLICT DO NOTHING/UPDATE`. Anonymises apartment metadata (`owner_user_id` → NULL, `building_name` → `Building <id>`; first names retained as RLS pseudonyms — see chapter 16).
@@ -128,6 +191,12 @@ KNIME workflows live in `ml/knime/*.knwf` and are deployed to `~/knime-workspace
 > **Session-level `work_mem` tuning:** each populate pass runs `SET work_mem = '256MB'` first, so the large `GROUP BY` queries stay in RAM rather than spilling to disk.
 
 ## 2.4 Gold → ML (KNIME)
+
+![BI dashboards — four Power BI / SAP SAC reports backed by gold facts](../../_personal/diagrams/manual/bi-dashboards.png)
+
+![Row-Level Security — three roles filtering on `apartment_key`](../../_personal/diagrams/manual/rls.png)
+
+![ML models — energy forecast (#27) + room presence (#26)](../../_personal/diagrams/manual/ml-models.png)
 
 `scripts/run_knime_predictions.py` invokes `knime.exe` in batch mode:
 
@@ -172,6 +241,8 @@ gold.dim_room
 ```
 
 ## 3.2 Star schema for sensor facts
+
+![Gold star schema — dimensions, facts, and FK relationships](../../_personal/diagrams/manual/star-schema.png)
 
 Every fact table shares the same dim spine:
 
@@ -929,5 +1000,67 @@ Every script was executed on the project VM and verified against expected output
 ## 19.4 Accountability Statement
 
 The authors retain full responsibility for the content of this report and for the design, implementation, and validation of the DataCycle Domotic platform. AI tools were used exclusively as support; all AI-assisted outputs were reviewed, corrected, and edited where necessary. Where the AI's contribution materially shaped a decision, this is reflected in the relevant ADR or in inline code comments.
+
+
+# References
+
+## Companion documents
+
+All in `docs/v2/` alongside this file:
+
+| Document | What's in it |
+|---|---|
+| [`INSTALLATION.md`](INSTALLATION.md) | Hardware/software requirements, the install wizard walkthrough with screenshots, ten install phases, verification + troubleshooting tables. |
+| [`REPORT.md`](REPORT.md) | Final project report — executive summary, GDPR assessment (Art 5 + data-subject rights), ethics, scalability projections, AI usage declaration, limitations. |
+| [`USER_GUIDE.md`](USER_GUIDE.md) | End-user docs for the Power BI dashboards (each tab) and the Streamlit admin pane. |
+| [`OPERATIONS.md`](OPERATIONS.md) | Day-2 runbook: log locations, restart procedures, retention policies, common failure modes and recoveries. |
+
+## Live project documentation site
+
+Everything in this document — and more — is also published as a browsable website at `_personal/website/` (Next.js). Run it locally with:
+
+```
+cd _personal/website
+npm install
+npm run dev
+# open http://localhost:3000
+```
+
+The site mirrors the markdown docs and adds:
+
+- **Architecture diagram** with clickable boxes — `/docs/architecture`
+- **Star schema** diagram with clickable cards (column lists, FK paths) — `/docs/data/schema`
+- **Pipeline workflows** with per-script details — `/docs/workflows/{sources-bronze,bronze-silver,silver-gold,gold-bi}`
+- **Architecture decisions (ADRs)** — `/docs/architecture/decisions`
+- **Setup wizard** that generates a self-contained installer — `/install`
+- **Sprint cadence + meeting notes** — `/scrum`
+
+## Source code
+
+GitHub: <https://github.com/dehlya/data-cycle-domotic>
+
+| Path | What it does |
+|---|---|
+| `ingestion/fast_flow/watcher.py` | Single long-running orchestrator (every-minute SMB scan, 15-min gold refresh, daily ML batch, monthly KNIME retrain, midnight full scan) |
+| `etl/bronze_to_silver/` | flatten_sensors.py · clean_weather.py · import_mysql_to_silver.py · create_silver.py |
+| `etl/silver_to_gold/` | create_gold.py · populate_gold.py (9-step) · populate_dimensions.py · populate_sensors.py · populate_weather.py |
+| `ml/knime/` | Motion_Prediction_Server.knwf · Consumption_Weather_Prediction_Server.knwf (KNIME 5.8 pinned) |
+| `bi/power_bi/DataCycleDomotic.pbix` | Power BI report with Row-Level Security |
+| `scripts/admin.py` | Streamlit admin pane (data freshness, watcher status, PBI first-time-setup wizard) |
+| `installer/install_template.py` | Template the wizard fills with credentials and ships to the customer |
+
+## Course materials
+
+- HES-SO Valais 64-61 Data Cycle Project — *Introduction 2026* (course PDF defining medallion architecture, deliverables, evaluation criteria)
+- Use Case 2 — Apartments Domotic — backlog acceptance criteria (issues #19, #20, #22, #24, #26, #27, #29, #32, #34, #35)
+
+## Tooling references
+
+- PostgreSQL 17 — <https://www.postgresql.org/docs/17/>
+- KNIME Analytics Platform 5.8 (batch mode, Variable to Credentials node) — <https://docs.knime.com/>
+- Power BI Desktop (RLS, DAX, DataMashup blob) — <https://learn.microsoft.com/power-bi/>
+- Streamlit (admin pane) — <https://docs.streamlit.io/>
+- SQLAlchemy + psycopg2 (ETL connector) — <https://docs.sqlalchemy.org/>
+
 
 — end of document —

@@ -90,6 +90,21 @@ REPO_BRANCH = "main"  # release-final was merged → main on 2026-05-01
 DEFAULT_INSTALL_DIR = "data-cycle-domotic"
 
 # =============================================================================
+# Pre-baked answers for post-install yes/no prompts.
+# Each value is one of "yes" | "no" | "ask".
+# - "yes"/"no": skip the prompt, take that action
+# - "ask":      keep the interactive prompt (current behavior)
+# Set in the wizard. Defaults below preserve current behavior if unset.
+# =============================================================================
+
+POSTINSTALL_RUN_SMB_BACKFILL    = "{{POSTINSTALL_RUN_SMB_BACKFILL}}"     # default: ask
+POSTINSTALL_OPEN_PBI            = "{{POSTINSTALL_OPEN_PBI}}"             # default: ask
+POSTINSTALL_RUN_KNIME           = "{{POSTINSTALL_RUN_KNIME}}"            # default: ask
+POSTINSTALL_AUTOSTART_WATCHER   = "{{POSTINSTALL_AUTOSTART_WATCHER}}"    # default: ask
+POSTINSTALL_START_WATCHER       = "{{POSTINSTALL_START_WATCHER}}"        # default: ask  (yes spawns detached console)
+POSTINSTALL_OPEN_ADMIN          = "{{POSTINSTALL_OPEN_ADMIN}}"           # default: ask
+
+# =============================================================================
 # UI
 # =============================================================================
 
@@ -181,6 +196,20 @@ def ask_yes_no(prompt: str, default: bool = False) -> bool:
     if not ans:
         return default
     return ans in ("y", "yes", "o", "oui")
+
+
+def ask_or_baked(prompt: str, baked: str, default: bool = False) -> bool:
+    """Same as ask_yes_no but honours a pre-baked 'yes'/'no'/'ask' answer
+    set in the wizard. 'ask' (or any unset/templated value) falls through to
+    the interactive prompt — backwards compatible with the old behavior."""
+    val = (baked or "").strip().lower()
+    if val == "yes":
+        print(f"  {DIM}{prompt}: yes (set in wizard){RESET}")
+        return True
+    if val == "no":
+        print(f"  {DIM}{prompt}: no (set in wizard){RESET}")
+        return False
+    return ask_yes_no(prompt, default=default)
 
 
 # =============================================================================
@@ -611,9 +640,10 @@ def backfill_bronze_silver(venv: Path, install_dir: Path):
     # on it. Skipping it leaves gold facts empty.
     run_smb = True
     if sys.stdin.isatty():
-        run_smb = ask_yes_no(
+        run_smb = ask_or_baked(
             "Run full SMB -> bronze -> silver backfill now? "
-            "(20-60 min, idempotent — safe to re-run)", default=True)
+            "(20-60 min, idempotent — safe to re-run)",
+            baked=POSTINSTALL_RUN_SMB_BACKFILL, default=True)
     else:
         warn("Non-interactive: defaulting to YES for SMB backfill")
 
@@ -674,7 +704,7 @@ def maybe_open_powerbi(install_dir: Path):
         warn(f"  Install from https://www.microsoft.com/en-us/download/details.aspx?id=58494")
         warn(f"  then double-click: {pbix}")
         return
-    if not ask_yes_no("Open the Power BI dashboard now?", default=True):
+    if not ask_or_baked("Open the Power BI dashboard now?", baked=POSTINSTALL_OPEN_PBI, default=True):
         return
     try:
         # Launch via the detected exe rather than os.startfile, so we don't
@@ -782,22 +812,8 @@ def maybe_run_predictions(venv: Path, install_dir: Path):
         return
     knime_exe = find_knime()
     if not knime_exe:
-        # Fallback: just open the folder so the user can see the .knwf files
-        folder = install_dir / "ml" / "knime"
-        if not folder.exists():
-            return
-        if not ask_yes_no("Open the KNIME workflows folder?", default=False):
-            return
-        try:
-            if os.name == "nt":
-                os.startfile(str(folder))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(folder)])
-            else:
-                subprocess.Popen(["xdg-open", str(folder)])
-            ok(f"Opened {folder}")
-        except Exception as e:
-            warn(f"Could not open folder: {e}")
+        warn("KNIME not found on PATH — skipping prediction step.")
+        warn("  Install KNIME 5.8 and re-run the watcher to retrain.")
         return
 
     runner = install_dir / "scripts" / "run_knime_predictions.py"
@@ -809,7 +825,7 @@ def maybe_run_predictions(venv: Path, install_dir: Path):
     print(f"  {DIM}KNIME workflows can be run now in batch mode (no GUI).{RESET}")
     print(f"  {DIM}This writes predictions into gold.fact_prediction.{RESET}")
     print(f"  {DIM}Takes 5-30 minutes depending on data volume.{RESET}")
-    if not ask_yes_no("Run KNIME prediction workflows now?", default=False):
+    if not ask_or_baked("Run KNIME prediction workflows now?", baked=POSTINSTALL_RUN_KNIME, default=False):
         warn(f"Skipped. Run later: {DIM}python scripts/run_knime_predictions.py{RESET}")
         return
 
@@ -844,7 +860,7 @@ def maybe_register_autostart(venv: Path, install_dir: Path):
     print(f"  {DIM}(06:30) it downloads weather + runs ML predictions.{RESET}")
     print(f"  {DIM}Auto-starting it on login means you literally never touch it.{RESET}")
     print()
-    if not ask_yes_no("Auto-start the watcher every time you log in?", default=True):
+    if not ask_or_baked("Auto-start the watcher every time you log in?", baked=POSTINSTALL_AUTOSTART_WATCHER, default=True):
         warn("Skipped. Run manually anytime: "
              f"{DIM}python ingestion/fast_flow/watcher.py{RESET}")
         return
@@ -943,19 +959,38 @@ def verify_data(venv: Path, db_url: str):
 
 
 def maybe_start_watcher(venv: Path, install_dir: Path):
-    if not sys.stdin.isatty():
+    """Start the watcher in a detached new console so the installer can finish.
+
+    Pre-baked answer is honoured (yes/no/ask). 'yes' spawns a new terminal
+    window running the watcher; the installer continues immediately.
+    """
+    if POSTINSTALL_START_WATCHER == "ask" and not sys.stdin.isatty():
         return
-    if not ask_yes_no("Start the watcher now? (runs continuously in this terminal)", default=False):
+    if not ask_or_baked(
+        "Start the watcher now in a new window? (runs continuously)",
+        baked=POSTINSTALL_START_WATCHER, default=False):
         return
-    print()
-    print(f"{DIM}Starting watcher... Ctrl+C to stop.{RESET}")
     py = venv_python(venv)
     env = os.environ.copy()
     env["PYTHONPATH"] = str(install_dir)
+    cmd = [str(py), "ingestion/fast_flow/watcher.py"]
     try:
-        subprocess.run([str(py), "ingestion/fast_flow/watcher.py"], cwd=str(install_dir), env=env)
-    except KeyboardInterrupt:
-        print(f"\n{DIM}Watcher stopped.{RESET}")
+        if sys.platform == "win32":
+            CREATE_NEW_CONSOLE = 0x00000010
+            subprocess.Popen(cmd, cwd=str(install_dir), env=env,
+                             creationflags=CREATE_NEW_CONSOLE)
+            print(f"  {GREEN}✓{RESET} Watcher launched in a new console window.")
+            print(f"  {DIM}  Close that window or press Ctrl+C in it to stop.{RESET}")
+        else:
+            # POSIX: detach via setsid so it survives this installer
+            subprocess.Popen(cmd, cwd=str(install_dir), env=env,
+                             start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"  {GREEN}✓{RESET} Watcher launched in background. "
+                  f"Tail logs at {install_dir / 'install.log'}.")
+    except Exception as e:
+        warn(f"Could not launch watcher: {e}")
+        warn("  You can start it manually: python ingestion/fast_flow/watcher.py")
 
 
 def maybe_launch_admin(venv: Path, install_dir: Path):
@@ -968,7 +1003,7 @@ def maybe_launch_admin(venv: Path, install_dir: Path):
     print()
     print(f"  {DIM}The admin dashboard is a single browser page that shows pipeline{RESET}")
     print(f"  {DIM}status, lets you trigger ETL/KNIME/PBI from buttons, and tails logs.{RESET}")
-    if not ask_yes_no("Launch the admin dashboard now?", default=True):
+    if not ask_or_baked("Launch the admin dashboard now?", baked=POSTINSTALL_OPEN_ADMIN, default=True):
         if os.name == "nt":
             print(f"  {DIM}Later: double-click {install_dir}\\scripts\\admin.bat{RESET}")
         else:
