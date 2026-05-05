@@ -131,7 +131,7 @@ The project's `README.md` at the root points to all of the above.
 
 ## 3. Architecture in brief
 
-![End-to-end pipeline diagram for UC2 — sources → bronze → silver → gold → BI/ML](../../_personal/diagrams/manual/architecture.png)
+![End-to-end pipeline diagram for UC2 — sources → bronze → silver → gold → BI/ML](diagrams/architecture.png)
 
 The diagram above lays out every component end-to-end. In short:
 
@@ -150,7 +150,7 @@ The gold layer is shaped as a star schema: seven conformed dimensions
 grains plus a single materialised view (`mv_energy_with_cost`) for the
 BI cost callouts.
 
-![Gold star schema — dimensions, facts, and FK relationships](../../_personal/diagrams/manual/star-schema.png)
+![Gold star schema — dimensions, facts, and FK relationships](diagrams/star-schema.png)
 
 
 A single Python process — `ingestion/fast_flow/watcher.py` — orchestrates
