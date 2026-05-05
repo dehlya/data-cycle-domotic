@@ -122,7 +122,7 @@ Opens at <http://localhost:8501>.
 ```
 ┌─ DataCycle Admin ──────────────────────────────────────┐
 │                                                        │
-│  Database     🟢  domotic@100.96.81.114:5432/domotic   │
+│  Database     🟢  domotic@<host>:5432/domotic          │
 │  Watcher      🟢  Running                              │
 │  Active job   ⚪  None                                  │
 │                                                        │
