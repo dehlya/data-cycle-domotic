@@ -14,6 +14,12 @@ already-done work).
 > steps in the middle — the installer handles all 10 phases automatically
 > and only stops at the very end for optional yes/no prompts.
 
+## What gets deployed
+
+For context, here is the end-to-end pipeline the installer is about to set up:
+
+![End-to-end pipeline diagram for UC2 — sources → bronze → silver → gold → BI/ML](../../_personal/diagrams/manual/architecture.png)
+
 ---
 
 ## Hardware & software requirements
