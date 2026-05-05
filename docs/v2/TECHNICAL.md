@@ -44,11 +44,11 @@ Section numbers above match the chapter headings below; ADRs (chapter 17) are al
 
 # Architecture overview
 
-![End-to-end pipeline diagram for UC2 — sources → bronze → silver → gold → BI/ML](../../_personal/diagrams/manual/architecture.png)
+![End-to-end pipeline diagram for UC2 — sources → bronze → silver → gold → BI/ML](diagrams/architecture.png)
 
 ## 1.1 Three external sources
 
-![Three sources at a glance — JSON sensors, MySQL pidb, weather CSV](../../_personal/diagrams/manual/sources-cards.png)
+![Three sources at a glance — JSON sensors, MySQL pidb, weather CSV](diagrams/sources-cards.png)
 
 
 | Source | Format | Volume | Path |
@@ -61,15 +61,15 @@ Skipped MySQL tables for GDPR / out-of-scope reasons: `users`, `events`, `action
 
 A worked example of each source format:
 
-![JSON sensor fields — six categories nested in each per-minute file](../../_personal/diagrams/manual/json-fields.png)
+![JSON sensor fields — six categories nested in each per-minute file](diagrams/json-fields.png)
 
-![Sample JSON readings — plugs, doorsWindows, motions, meteos, humidities, consumptions](../../_personal/diagrams/manual/json-sample.png)
+![Sample JSON readings — plugs, doorsWindows, motions, meteos, humidities, consumptions](diagrams/json-sample.png)
 
-![MySQL `pidb` → silver tables we ingest](../../_personal/diagrams/manual/mysql-tables.png)
+![MySQL `pidb` → silver tables we ingest](diagrams/mysql-tables.png)
 
-![Tables explicitly skipped at ingestion — GDPR + non-analytical](../../_personal/diagrams/manual/mysql-skipped.png)
+![Tables explicitly skipped at ingestion — GDPR + non-analytical](diagrams/mysql-skipped.png)
 
-![Weather forecast CSV — sample rows from a daily file (Sion site, PRED_T_2M_ctrl)](../../_personal/diagrams/manual/weather-sample.png)
+![Weather forecast CSV — sample rows from a daily file (Sion site, PRED_T_2M_ctrl)](diagrams/weather-sample.png)
 
 ## 1.2 Medallion layers (PostgreSQL 17)
 
@@ -77,7 +77,7 @@ Three storage tiers, each with a distinct purpose:
 
 - **Bronze** — raw, immutable JSON / CSV files on the filesystem, partitioned by year/month/day/hour. Acts as the source of truth before any cleanup is applied. After successful silver insert, files are gzip-compressed in place (10–15× smaller) but kept readable so silver can always be replayed from bronze.
 
-  ![Bronze on-disk layout — Y/M/D/H folder partitioning](../../_personal/diagrams/manual/bronze-structure.png)
+  ![Bronze on-disk layout — Y/M/D/H folder partitioning](diagrams/bronze-structure.png)
 
 - **Silver** — cleaned, normalised PostgreSQL tables. Sensor events go to a long-format `silver.sensor_events`; weather rows go to `silver.weather_forecasts` with one row per `(timestamp, site, prediction, prediction_date, measurement)` so all forecast revisions are preserved.
 - **Gold** — analytical star schema with conformed dimensions (`dim_apartment`, `dim_room`, `dim_device`, `dim_date`, `dim_datetime`, `dim_tariff`, `dim_weather_site`) and pre-aggregated fact tables (`fact_environment_minute`, `fact_energy_minute`, `fact_presence_minute`, `fact_device_health_day`, `fact_weather_hour`, `fact_prediction_motion`, `fact_prediction_consumption`) plus one materialised view (`mv_energy_with_cost`).
@@ -109,7 +109,7 @@ KNIME workflows live in `ml/knime/*.knwf` and are deployed to `~/knime-workspace
 
 ## 2.1 Bronze ingestion
 
-![Bronze filename + folder convention](../../_personal/diagrams/manual/json-format.png)
+![Bronze filename + folder convention](diagrams/json-format.png)
 
 ### Sensor JSONs (continuous)
 
@@ -132,13 +132,13 @@ KNIME workflows live in `ml/knime/*.knwf` and are deployed to `~/knime-workspace
 
 ## 2.2 Bronze → Silver
 
-![Bronze → Silver — eight transformations applied during flatten](../../_personal/diagrams/manual/bronze-silver-transforms.png)
+![Bronze → Silver — eight transformations applied during flatten](diagrams/bronze-silver-transforms.png)
 
-![Schema creation — create_silver.py (run once per environment)](../../_personal/diagrams/manual/create-silver.png)
+![Schema creation — create_silver.py (run once per environment)](diagrams/create-silver.png)
 
-![MySQL dimension import — 10 imported, 6 skipped](../../_personal/diagrams/manual/mysql-import.png)
+![MySQL dimension import — 10 imported, 6 skipped](diagrams/mysql-import.png)
 
-![Weather cleaning — clean_weather.py (sentinel filter + outlier flags + watermark)](../../_personal/diagrams/manual/clean-weather.png)
+![Weather cleaning — clean_weather.py (sentinel filter + outlier flags + watermark)](diagrams/clean-weather.png)
 
 ### Sensors
 
@@ -169,11 +169,11 @@ KNIME workflows live in `ml/knime/*.knwf` and are deployed to `~/knime-workspace
 
 ## 2.3 Silver → Gold
 
-![Gold schema — 5 dimensions + 4 facts + 1 materialized view](../../_personal/diagrams/manual/gold-summary.png)
+![Gold schema — 5 dimensions + 4 facts + 1 materialized view](diagrams/gold-summary.png)
 
-![Schema creation — create_gold.py (idempotent, builds dim_* and fact_* shells)](../../_personal/diagrams/manual/create-gold.png)
+![Schema creation — create_gold.py (idempotent, builds dim_* and fact_* shells)](diagrams/create-gold.png)
 
-![Population — populate_gold.py 9-step process with idempotent upserts](../../_personal/diagrams/manual/populate-gold.png)
+![Population — populate_gold.py 9-step process with idempotent upserts](diagrams/populate-gold.png)
 
 
 `etl/silver_to_gold/populate_gold.py` orchestrates a **9-step process** in order:
@@ -192,11 +192,11 @@ KNIME workflows live in `ml/knime/*.knwf` and are deployed to `~/knime-workspace
 
 ## 2.4 Gold → ML (KNIME)
 
-![BI dashboards — four Power BI / SAP SAC reports backed by gold facts](../../_personal/diagrams/manual/bi-dashboards.png)
+![BI dashboards — four Power BI / SAP SAC reports backed by gold facts](diagrams/bi-dashboards.png)
 
-![Row-Level Security — three roles filtering on `apartment_key`](../../_personal/diagrams/manual/rls.png)
+![Row-Level Security — three roles filtering on `apartment_key`](diagrams/rls.png)
 
-![ML models — energy forecast (#27) + room presence (#26)](../../_personal/diagrams/manual/ml-models.png)
+![ML models — energy forecast (#27) + room presence (#26)](diagrams/ml-models.png)
 
 `scripts/run_knime_predictions.py` invokes `knime.exe` in batch mode:
 
@@ -242,7 +242,7 @@ gold.dim_room
 
 ## 3.2 Star schema for sensor facts
 
-![Gold star schema — dimensions, facts, and FK relationships](../../_personal/diagrams/manual/star-schema.png)
+![Gold star schema — dimensions, facts, and FK relationships](diagrams/star-schema.png)
 
 Every fact table shares the same dim spine:
 
@@ -584,7 +584,7 @@ Zero credentials transit through any backend (form values never leave the browse
 
 ### Trade-offs accepted
 
-The user must trust the wizard / install_template — but the file is open source. The template lives in two places (`installer/` and `_personal/website/public/`) and must be kept in sync. Synced via a `cp` in commit hooks.
+The user must trust the wizard / install_template — but the file is open source. The canonical template lives in `installer/install_template.py` and is fetched at download time by the install wizard frontend (a separate Next.js project, see References). The two copies are kept in sync by a build-time copy step.
 
 ## ADR 009 · KNIME 5.8 version pin (after the 5.9 mismatch)
 
@@ -634,7 +634,6 @@ We touch the customer's system Python, not just our venv. The install footprint 
 |---|---|---|---|
 | Language | Python | 3.10+ (3.12 tested) | Single language across ingestion, ETL, ML wrappers, admin pane |
 | Database | PostgreSQL | 17 | Strong COPY performance, JSON support for raw bronze, materialised views, free |
-| Async I/O | asyncio + aiohttp | 3.9 | Used by `recup.py` for concurrent sensor polling (legacy) |
 | MySQL client | aiomysql | 0.2 | Reads the school's `pidb` apartment metadata |
 | Postgres driver | psycopg2-binary | 2.9 | Wins over asyncpg here for COPY support |
 | ORM / DDL helper | SQLAlchemy | 2.0 | Used for schema bootstrap; bulk inserts go through psycopg2 directly |
@@ -988,6 +987,7 @@ Generative AI was used as a drafting and pair-programming aid during the project
 | Documentation | Drafted sections from the authors' notes; edited and corrected by the authors |
 | Python boilerplate | Initial drafts for ETL scripts, watcher loop, admin pane scaffolding, the .docx generator |
 | Inline code comments | Drafted docstrings and explanatory comments inside the scripts |
+| Commit messages | Drafted messages explaining commits clearly and in detail |
 | Log messages | Wording of progress lines, warnings, and error messages emitted by the pipeline |
 | Debugging | Suggested fixes during the KNIME credential-injection investigation, the silver unique-index slowdown, the Power BI Python `matplotlib` issue, and the KNIME 5.9 → 5.8 version-mismatch resolution |
 | Architecture discussions | Sounding-board for trade-offs (compress vs. delete, watcher vs. Airflow, PBI venv-redirect attempts) — final decisions made and ratified by the human team |
@@ -1017,16 +1017,7 @@ All in `docs/v2/` alongside this file:
 
 ## Live project documentation site
 
-Everything in this document — and more — is also published as a browsable website at `_personal/website/` (Next.js). Run it locally with:
-
-```
-cd _personal/website
-npm install
-npm run dev
-# open http://localhost:3000
-```
-
-The site mirrors the markdown docs and adds:
+Everything in this document — and more — is also published as a browsable Next.js site shipped to the customer alongside the installer (separate `DCP-Website` repository, deployed locally on the project VM at `http://localhost:3000`). The site mirrors the markdown docs and adds:
 
 - **Architecture diagram** with clickable boxes — `/docs/architecture`
 - **Star schema** diagram with clickable cards (column lists, FK paths) — `/docs/data/schema`

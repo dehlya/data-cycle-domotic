@@ -18,7 +18,7 @@ already-done work).
 
 For context, here is the end-to-end pipeline the installer is about to set up:
 
-![End-to-end pipeline diagram for UC2 — sources → bronze → silver → gold → BI/ML](../../_personal/diagrams/manual/architecture.png)
+![End-to-end pipeline diagram for UC2 — sources → bronze → silver → gold → BI/ML](diagrams/architecture.png)
 
 ---
 
