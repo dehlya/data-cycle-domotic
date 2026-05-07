@@ -67,7 +67,7 @@ def populate(engine, log, YE, R):
                 UNION
                 SELECT timestamp AS d FROM silver.weather_forecasts
             ) all_timestamps
-            ON CONFLICT (timestamp_utc) DO NOTHING
+            ON CONFLICT (datetime_key) DO NOTHING
         """))
         log.info(f"dim_datetime: {result.rowcount} rows inserted")
 
